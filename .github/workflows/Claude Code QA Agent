@@ -1,0 +1,6 @@
+- name: Claude Code QA Agent
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  run: |
+    npm install -g @anthropic-ai/claude-code
+    claude -p "Run /qa-full on the changes in this PR. Output results to qa-report.md"
