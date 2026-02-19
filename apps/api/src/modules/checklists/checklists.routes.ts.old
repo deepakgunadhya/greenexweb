@@ -1,0 +1,75 @@
+import { Router } from 'express';
+import { ChecklistsController } from './checklists.controller';
+import { authenticateToken, requirePermissions } from '../../middleware/auth.middleware';
+
+const router: Router = Router();
+const checklistsController = new ChecklistsController();
+
+// Apply authentication to all routes
+router.use(authenticateToken);
+
+// Template CRUD routes
+router.get('/templates', 
+  requirePermissions(['checklists:read']), 
+  checklistsController.getTemplates
+);
+
+router.get('/templates/:id', 
+  requirePermissions(['checklists:read']), 
+  checklistsController.getTemplate
+);
+
+router.post('/templates', 
+  requirePermissions(['checklists:create']), 
+  checklistsController.createTemplate
+);
+
+router.put('/templates/:id', 
+  requirePermissions(['checklists:update']), 
+  checklistsController.updateTemplate
+);
+
+router.delete('/templates/:id', 
+  requirePermissions(['checklists:delete']), 
+  checklistsController.deleteTemplate
+);
+
+// Template item management routes
+router.post('/templates/:id/items', 
+  requirePermissions(['checklists:create']), 
+  checklistsController.addTemplateItem
+);
+
+router.put('/templates/:templateId/items/:itemId', 
+  requirePermissions(['checklists:update']), 
+  checklistsController.updateTemplateItem
+);
+
+router.delete('/templates/:templateId/items/:itemId', 
+  requirePermissions(['checklists:delete']), 
+  checklistsController.deleteTemplateItem
+);
+
+// Advanced template operations
+router.put('/templates/:id/items/reorder', 
+  requirePermissions(['checklists:update']), 
+  checklistsController.reorderTemplateItems
+);
+
+router.put('/templates/:id/services', 
+  requirePermissions(['checklists:update']), 
+  checklistsController.associateWithServices
+);
+
+router.post('/templates/:id/clone', 
+  requirePermissions(['checklists:create']), 
+  checklistsController.cloneTemplate
+);
+
+// Utility routes
+router.get('/templates/by-service/:serviceId', 
+  requirePermissions(['checklists:read']), 
+  checklistsController.getTemplatesByService
+);
+
+export default router;

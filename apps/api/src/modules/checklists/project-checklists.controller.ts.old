@@ -1,0 +1,1059 @@
+import { Request, Response } from "express";
+import { AuthenticatedRequest } from "../../middleware/auth.middleware";
+import { successResponse, errorResponse } from "../../utils/response";
+import { asyncHandler, AppError } from "../../middleware/error.middleware";
+import { ProjectChecklistService, UpdateChecklistItemDto, VerifyChecklistDto } from "./project-checklist.service";
+import { logger } from "../../utils/logger";
+import prisma from "../../config/database";
+
+export class ProjectChecklistsController {
+  private checklistService = new ProjectChecklistService();
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists:
+   *   get:
+   *     summary: Get all checklists for a project
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Project ID
+   *       - in: query
+   *         name: status
+   *         schema:
+   *           type: string
+   *           enum: [draft, in_progress, ready_for_verification, verified_passed, verified_failed, finalized, superseded]
+   *         description: Filter by checklist status
+   *       - in: query
+   *         name: version
+   *         schema:
+   *           type: integer
+   *         description: Filter by checklist version
+   *     responses:
+   *       200:
+   *         description: Project checklists retrieved successfully
+   *       404:
+   *         description: Project not found
+   */
+  getProjectChecklists = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId } = req.params;
+    const { status, version } = req.query;
+
+    const assignments = await this.checklistService.getProjectTemplateAssignments(
+      projectId,
+      status as string | undefined,
+      version ? Number(version) : undefined
+    );
+
+    res.json(successResponse((assignments)));
+  });
+
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}:
+   *   get:
+   *     summary: Get specific project checklist with items
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Project checklist retrieved successfully
+   *       404:
+   *         description: Checklist not found
+   */
+  getProjectChecklist = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId } = req.params;
+
+    const checklist = await this.checklistService.getChecklist(checklistId);
+
+    if (!checklist || checklist.projectId !== projectId) {
+      throw new AppError('Project checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+    }
+
+    // Serialize checklist - convert Decimal to number and format dates
+    const serializedChecklist = {
+      ...checklist,
+      completenessPercent: typeof checklist.completenessPercent === 'object'
+        ? Number(checklist.completenessPercent)
+        : checklist.completenessPercent,
+      createdAt: checklist.createdAt.toISOString(),
+      updatedAt: checklist.updatedAt.toISOString(),
+      verifiedAt: checklist.verifiedAt ? checklist.verifiedAt.toISOString() : undefined,
+      items: checklist.items ? checklist.items.map(item => ({
+        ...item,
+        valueDate: item.valueDate ? new Date(item.valueDate).toISOString() : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt).toISOString() : undefined,
+        files: item.files ? item.files.map(file => ({
+          ...file,
+          uploadedAt: new Date(file.uploadedAt).toISOString(),
+          fileSize: file.fileSize ? Number(file.fileSize) : undefined
+        })) : []
+      })) : []
+    };
+
+    res.json(successResponse(serializedChecklist));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists:
+   *   post:
+   *     summary: Create checklists for a project (from services)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       201:
+   *         description: Checklists created successfully
+   *       400:
+   *         description: Checklists already exist or project has no services
+   *       404:
+   *         description: Project not found
+   */
+  createProjectChecklists = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId } = req.params;
+
+    const checklists = await this.checklistService.createChecklistsForProject(projectId);
+
+    // Serialize checklists - convert Decimal to number and format dates
+    const serializedChecklists = checklists.map(checklist => ({
+      ...checklist,
+      completenessPercent: typeof checklist.completenessPercent === 'object'
+        ? Number(checklist.completenessPercent)
+        : checklist.completenessPercent,
+      createdAt: checklist.createdAt.toISOString(),
+      updatedAt: checklist.updatedAt.toISOString(),
+      verifiedAt: checklist.verifiedAt ? checklist.verifiedAt.toISOString() : undefined,
+      items: checklist.items ? checklist.items.map(item => ({
+        ...item,
+        valueDate: item.valueDate ? new Date(item.valueDate).toISOString() : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt).toISOString() : undefined,
+        files: item.files ? item.files.map(file => ({
+          ...file,
+          uploadedAt: new Date(file.uploadedAt).toISOString(),
+          fileSize: file.fileSize ? Number(file.fileSize) : undefined
+        })) : []
+      })) : []
+    }));
+
+    res.status(201).json(successResponse(serializedChecklists));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/assign-template:
+   *   post:
+   *     summary: Manually assign additional checklist template to project
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Project ID
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - templateId
+   *             properties:
+   *               templateId:
+   *                 type: string
+   *                 description: ID of the checklist template to assign
+   *               reason:
+   *                 type: string
+   *                 description: Reason for manual assignment
+   *     responses:
+   *       201:
+   *         description: Template assigned successfully
+   *       400:
+   *         description: Template already assigned or invalid
+   *       404:
+   *         description: Project or template not found
+   */
+  assignTemplateToProject = asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const { projectId } = req.params;
+    const { templateFileId, reason } = req.body;
+
+    if (!templateFileId) {
+      throw new AppError(
+        'templateFileId is required',
+        400,
+        'TEMPLATE_FILE_ID_REQUIRED'
+      );
+    }
+
+    const assignment = await this.checklistService.assignTemplateToProject(
+      projectId,
+      templateFileId,
+      req.user.id,
+      reason
+    );
+
+    res.status(201).json(
+      successResponse(assignment, {
+        message: 'Template assigned to project successfully'
+      })
+    );
+  });
+
+
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/available-templates:
+   *   get:
+   *     summary: Get available checklist templates for manual assignment
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Project ID
+   *     responses:
+   *       200:
+   *         description: Available templates retrieved successfully
+   *       404:
+   *         description: Project not found
+   */
+  // getAvailableTemplates = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+  //   const { projectId } = req.params;
+
+  //   const templates = await this.checklistService.getAvailableTemplatesForProject(projectId);
+
+  //   // Remove _count from response as we already have itemCount
+  //   const serializedTemplates = templates.map(({ _count, ...template }) => template);
+
+  //   res.json(successResponse(serializedTemplates, {
+  //     message: `Found ${serializedTemplates.length} available templates for manual assignment`
+  //   }));
+  // });
+  getAvailableTemplates = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId } = req.params;
+    const { category } = req.query;
+
+    const templates = await this.checklistService.getAvailableTemplatesForProject(
+      projectId,
+      category as string
+    );
+
+    res.json(successResponse(templates, {
+      message: `Found ${templates.length} available template(s) for assignment`
+    }));
+  });
+
+
+  getTemplateFiles = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { category, clientVisible, search } = req.query;
+
+    const filters: any = {};
+
+    if (category) {
+      filters.category = category as string;
+    }
+
+    if (clientVisible !== undefined) {
+      filters.clientVisible = clientVisible === 'true';
+    }
+
+    if (search) {
+      filters.search = search as string;
+    }
+
+    const templateFiles = await this.checklistService.getTemplateFiles(filters);
+
+    res.json(successResponse(templateFiles, {
+      message: `Found ${templateFiles.length} template file(s)`,
+      count: templateFiles.length
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/items/{itemId}:
+   *   put:
+   *     summary: Update a checklist item value
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: itemId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               valueText:
+   *                 type: string
+   *               valueNumber:
+   *                 type: number
+   *               valueDate:
+   *                 type: string
+   *                 format: date-time
+   *               valueBoolean:
+   *                 type: boolean
+   *     responses:
+   *       200:
+   *         description: Checklist item updated successfully
+   *       404:
+   *         description: Item not found
+   */
+  updateChecklistItem = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId, itemId } = req.params;
+    const updateData: UpdateChecklistItemDto = {
+      ...req.body,
+      filledBy: req.user?.id || '' // From auth middleware
+    };
+
+    const updatedItem = await this.checklistService.updateChecklistItem(itemId, updateData);
+
+    // Serialize item - convert dates and file sizes
+    const serializedItem = {
+      ...updatedItem,
+      valueDate: updatedItem.valueDate ? new Date(updatedItem.valueDate).toISOString() : undefined,
+      filledAt: updatedItem.filledAt ? new Date(updatedItem.filledAt).toISOString() : undefined,
+      files: updatedItem.files ? updatedItem.files.map(file => ({
+        ...file,
+        uploadedAt: new Date(file.uploadedAt).toISOString(),
+        fileSize: file.fileSize ? Number(file.fileSize) : undefined
+      })) : []
+    };
+
+    res.json(successResponse(serializedItem));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/verify:
+   *   post:
+   *     summary: Verify a checklist (QA process)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               verificationComments:
+   *                 type: string
+   *               itemVerifications:
+   *                 type: array
+   *                 items:
+   *                   type: object
+   *                   properties:
+   *                     itemId:
+   *                       type: string
+   *                     verifiedStatus:
+   *                       type: string
+   *                       enum: [accepted, needs_clarification]
+   *                     verifierComment:
+   *                       type: string
+   *     responses:
+   *       200:
+   *         description: Checklist verified successfully
+   *       400:
+   *         description: Checklist not ready for verification
+   *       404:
+   *         description: Checklist not found
+   */
+  verifyChecklist = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId } = req.params;
+    const verificationData: VerifyChecklistDto = {
+      ...req.body,
+      verifiedBy: req.user?.id || '' // From auth middleware
+    };
+
+    const result = await this.checklistService.verifyChecklist(checklistId, verificationData);
+
+    // Serialize checklist - convert Decimal to number and format dates
+    const serializedChecklist = {
+      ...result,
+      completenessPercent: typeof result.completenessPercent === 'object'
+        ? Number(result.completenessPercent)
+        : result.completenessPercent,
+      createdAt: result.createdAt.toISOString(),
+      updatedAt: result.updatedAt.toISOString(),
+      verifiedAt: result.verifiedAt ? result.verifiedAt.toISOString() : undefined,
+      items: result.items ? result.items.map(item => ({
+        ...item,
+        valueDate: item.valueDate ? new Date(item.valueDate).toISOString() : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt).toISOString() : undefined,
+        files: item.files ? item.files.map(file => ({
+          ...file,
+          uploadedAt: new Date(file.uploadedAt).toISOString(),
+          fileSize: file.fileSize ? Number(file.fileSize) : undefined
+        })) : []
+      })) : []
+    };
+
+    res.json(successResponse(serializedChecklist));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/completeness:
+   *   get:
+   *     summary: Get checklist completeness calculation
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Completeness calculation retrieved successfully
+   */
+  getChecklistCompleteness = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId } = req.params;
+
+    const completeness = await this.checklistService.updateChecklistCompleteness(checklistId);
+    res.json(successResponse(completeness));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/status:
+   *   put:
+   *     summary: Update checklist status
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - status
+   *             properties:
+   *               status:
+   *                 type: string
+   *                 enum: [draft, in_progress, ready_for_verification, verified_passed, verified_failed, finalized, superseded]
+   *     responses:
+   *       200:
+   *         description: Checklist status updated successfully
+   *       400:
+   *         description: Invalid status transition
+   */
+  updateChecklistStatus = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId } = req.params;
+    const { status } = req.body;
+
+    // For status updates, we need to implement this in the service
+    // For now, let's handle specific status transitions
+    if (status === 'ready_for_verification') {
+      await this.checklistService.submitForVerification(checklistId, req.user?.id || '');
+    } else if (status === 'finalized') {
+      await this.checklistService.finalizeChecklist(checklistId, req.user?.id || '');
+    }
+
+    // Get updated checklist
+    const updatedChecklist = await this.checklistService.getChecklist(checklistId);
+
+    if (!updatedChecklist) {
+      throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+    }
+
+    // Serialize checklist - convert Decimal to number and format dates
+    const serializedChecklist = {
+      ...updatedChecklist,
+      completenessPercent: typeof updatedChecklist.completenessPercent === 'object'
+        ? Number(updatedChecklist.completenessPercent)
+        : updatedChecklist.completenessPercent,
+      createdAt: updatedChecklist.createdAt.toISOString(),
+      updatedAt: updatedChecklist.updatedAt.toISOString(),
+      verifiedAt: updatedChecklist.verifiedAt ? updatedChecklist.verifiedAt.toISOString() : undefined,
+      items: updatedChecklist.items ? updatedChecklist.items.map(item => ({
+        ...item,
+        valueDate: item.valueDate ? new Date(item.valueDate).toISOString() : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt).toISOString() : undefined,
+        files: item.files ? item.files.map(file => ({
+          ...file,
+          uploadedAt: new Date(file.uploadedAt).toISOString(),
+          fileSize: file.fileSize ? Number(file.fileSize) : undefined
+        })) : []
+      })) : []
+    };
+
+    res.json(successResponse(serializedChecklist));
+  });
+
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/items/{itemId}/files:
+   *   post:
+   *     summary: Upload file for checklist item
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: itemId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         multipart/form-data:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               file:
+   *                 type: string
+   *                 format: binary
+   *     responses:
+   *       201:
+   *         description: File uploaded successfully
+   *       400:
+   *         description: Invalid file or item type
+   */
+  uploadItemFile = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId, itemId } = req.params;
+
+    if (!req.file) {
+      throw new AppError('No file uploaded', 400, 'NO_FILE');
+    }
+
+    const uploadedFile = await this.checklistService.uploadFileForItem(
+      itemId,
+      req.file?.path || '',
+      req.file?.originalname || '',
+      BigInt(req.file?.size || 0),
+      req.file?.mimetype || '',
+      req.user?.id || ''
+    );
+
+    // Serialize file - convert dates and file sizes
+    const serializedFile = {
+      ...uploadedFile,
+      uploadedAt: uploadedFile.uploadedAt.toISOString(),
+      fileSize: uploadedFile.fileSize ? Number(uploadedFile.fileSize) : undefined
+    };
+
+    res.status(201).json(successResponse(serializedFile));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/items/{itemId}/files/{fileId}/download:
+   *   get:
+   *     summary: Download checklist item file
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: itemId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: File download
+   *         content:
+   *           application/octet-stream:
+   *             schema:
+   *               type: string
+   *               format: binary
+   *       404:
+   *         description: File not found
+   */
+  // DISABLED: This function is for the old form-based checklist system
+  // The document-based system uses template files and client submissions instead
+  downloadItemFile = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId, itemId, fileId } = req.params;
+
+    throw new AppError('This endpoint is not available for document-based checklists. Use /template-files/attachments/:id/download instead.', 404, 'ENDPOINT_NOT_AVAILABLE');
+
+    /* OLD CODE - COMMENTED OUT
+    const fs = require('fs');
+    const path = require('path');
+
+    // Find the file in database
+    const itemFile = await prisma.checklistItemFile.findUnique({
+      where: { id: fileId },
+      include: {
+        item: {
+          include: {
+            checklist: true
+          }
+        }
+      }
+    });
+
+    if (!itemFile) {
+      throw new AppError('File not found', 404, 'FILE_NOT_FOUND');
+    }
+
+    // Verify the file belongs to the correct item and checklist
+    if (itemFile.itemId !== itemId || itemFile.item.checklistId !== checklistId) {
+      throw new AppError('File not found for this checklist item', 404, 'FILE_NOT_FOUND');
+    }
+
+    // Resolve the file path
+    const filePath = path.resolve(itemFile.filePath);
+
+    // Check if file exists
+    try {
+      await fs.promises.access(filePath);
+    } catch {
+      throw new AppError('File not found on server', 404, 'FILE_NOT_FOUND');
+    }
+
+    // Get MIME type
+    const ext = path.extname(itemFile.originalName).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      '.pdf': 'application/pdf',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.txt': 'text/plain',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png'
+    };
+    const mimeType = mimeTypes[ext] || itemFile.mimeType || 'application/octet-stream';
+
+    // Set headers for download
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${itemFile.originalName}"`
+    );
+
+    // Send the file
+    res.sendFile(filePath);
+
+    logger.info('Checklist item file downloaded', {
+      fileId,
+      itemId,
+      checklistId,
+      downloadedBy: req.user?.id,
+      filename: itemFile.originalName
+    });
+    */
+  });
+
+  /**
+   * @swagger
+   * /api/v1/projects/{projectId}/checklists/{checklistId}/clone:
+   *   post:
+   *     summary: Clone checklist as new version
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: projectId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               reason:
+   *                 type: string
+   *                 description: Reason for creating new version
+   *     responses:
+   *       201:
+   *         description: Checklist cloned successfully
+   *       400:
+   *         description: Cannot clone checklist in current state
+   */
+  cloneChecklistVersion = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { projectId, checklistId } = req.params;
+    const { reason } = req.body;
+
+    const newVersion = await this.checklistService.createNewVersion(checklistId, reason);
+
+    // Serialize checklist - convert Decimal to number and format dates
+    const serializedChecklist = {
+      ...newVersion,
+      completenessPercent: typeof newVersion.completenessPercent === 'object'
+        ? Number(newVersion.completenessPercent)
+        : newVersion.completenessPercent,
+      createdAt: newVersion.createdAt.toISOString(),
+      updatedAt: newVersion.updatedAt.toISOString(),
+      verifiedAt: newVersion.verifiedAt ? newVersion.verifiedAt.toISOString() : undefined,
+      items: newVersion.items ? newVersion.items.map(item => ({
+        ...item,
+        valueDate: item.valueDate ? new Date(item.valueDate).toISOString() : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt).toISOString() : undefined,
+        files: item.files ? item.files.map(file => ({
+          ...file,
+          uploadedAt: new Date(file.uploadedAt).toISOString(),
+          fileSize: file.fileSize ? Number(file.fileSize) : undefined
+        })) : []
+      })) : []
+    };
+
+    res.status(201).json(successResponse(serializedChecklist));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/files/{fileId}/submit:
+   *   post:
+   *     summary: Submit file for review (Client action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: File ID
+   *     responses:
+   *       200:
+   *         description: File submitted successfully
+   *       404:
+   *         description: File not found
+   */
+  submitFileForReview = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { fileId } = req.params;
+    const userId = req.user!.id;
+
+    const updatedFile = await this.checklistService.submitFileForReview(fileId, userId);
+
+    res.status(200).json(successResponse({
+      message: 'File submitted for review successfully',
+      file: updatedFile
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/files/{fileId}/mark-under-review:
+   *   post:
+   *     summary: Mark file as under review (Admin action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: File ID
+   *     responses:
+   *       200:
+   *         description: File marked as under review
+   *       404:
+   *         description: File not found
+   */
+  markFileUnderReview = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { fileId } = req.params;
+    const userId = req.user!.id;
+
+    const updatedFile = await this.checklistService.markFileUnderReview(fileId, userId);
+
+    res.status(200).json(successResponse({
+      message: 'File marked as under review',
+      file: updatedFile
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/files/{fileId}/send-back:
+   *   post:
+   *     summary: Send file back with remarks (Admin action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: File ID
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - remarks
+   *             properties:
+   *               remarks:
+   *                 type: string
+   *     responses:
+   *       200:
+   *         description: File sent back with remarks
+   *       404:
+   *         description: File not found
+   */
+  sendFileBackWithRemarks = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { fileId } = req.params;
+    const { remarks } = req.body;
+    const userId = req.user!.id;
+
+    if (!remarks) {
+      throw new AppError('Remarks are required when sending file back', 400);
+    }
+
+    const updatedFile = await this.checklistService.sendFileBackWithRemarks(fileId, userId, remarks);
+
+    res.status(200).json(successResponse({
+      message: 'File sent back with remarks',
+      file: updatedFile
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/files/{fileId}/verify:
+   *   post:
+   *     summary: Verify file (Admin action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: File ID
+   *     responses:
+   *       200:
+   *         description: File verified successfully
+   *       404:
+   *         description: File not found
+   */
+  verifyFile = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { fileId } = req.params;
+    const userId = req.user!.id;
+
+    const updatedFile = await this.checklistService.verifyFile(fileId, userId);
+
+    res.status(200).json(successResponse({
+      message: 'File verified successfully',
+      file: updatedFile
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/{checklistId}/close:
+   *   post:
+   *     summary: Close checklist and lock all files (Admin action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Checklist ID
+   *     responses:
+   *       200:
+   *         description: Checklist closed and files locked
+   *       404:
+   *         description: Checklist not found
+   */
+  closeChecklistAndLockFiles = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { checklistId } = req.params;
+
+    const updatedChecklist = await this.checklistService.closeChecklistAndLockFiles(checklistId);
+
+    res.status(200).json(successResponse({
+      message: 'Checklist closed and all files locked',
+      checklist: updatedChecklist
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/files/{fileId}/versions:
+   *   get:
+   *     summary: Get file version history
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: fileId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: File ID
+   *     responses:
+   *       200:
+   *         description: File version history retrieved
+   *       404:
+   *         description: File not found
+   */
+  getFileVersionHistory = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { fileId } = req.params;
+
+    const versions = await this.checklistService.getFileVersionHistory(fileId);
+
+    res.status(200).json(successResponse({
+      versions
+    }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/{checklistId}/submit:
+   *   post:
+   *     summary: Submit all files in checklist for review (Client action)
+   *     tags: [Project Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: checklistId
+   *         required: true
+   *         schema:
+   *           type: string
+   *         description: Checklist ID
+   *     responses:
+   *       200:
+   *         description: All files submitted for review
+   *       404:
+   *         description: Checklist not found
+   */
+  submitChecklistForReview = asyncHandler(async (req: AuthenticatedRequest, res: Response) => {
+    const { checklistId } = req.params;
+    const userId = req.user!.id;
+
+    const result = await this.checklistService.submitChecklistForReview(checklistId, userId);
+
+    res.status(200).json(successResponse({
+      message: 'Checklist submitted for review',
+      ...result
+    }));
+  });
+}

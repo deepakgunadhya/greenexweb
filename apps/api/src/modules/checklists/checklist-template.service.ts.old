@@ -1,0 +1,572 @@
+import prisma from '../../config/database';
+import { AppError } from '../../middleware/error.middleware';
+import { logger } from '../../utils/logger';
+
+export interface CreateTemplateDto {
+  name: string;
+  category: string; // environment, labour, ethics, procurement, other
+  description?: string;
+  expectedTatDays?: number;
+  items: CreateTemplateItemDto[];
+  serviceIds?: string[]; // Services to associate with this template
+}
+
+export interface UpdateTemplateDto {
+  name?: string;
+  category?: string;
+  description?: string;
+  expectedTatDays?: number;
+  isActive?: boolean;
+}
+
+export interface CreateTemplateItemDto {
+  itemCode: string; // ENV_POL_01, LAB_TRA_02, etc.
+  label: string;
+  type: 'text' | 'textarea' | 'number' | 'dropdown' | 'date' | 'file' | 'multi_file' | 'reference';
+  helpText?: string;
+  isMandatory: boolean;
+  visibleToClient: boolean;
+  expectedDocumentType?: string;
+  sectionGroup?: string;
+  sortOrder?: number;
+  dropdownOptions?: { options: string[] }; // For dropdown type
+}
+
+export interface UpdateTemplateItemDto {
+  label?: string;
+  type?: string;
+  helpText?: string;
+  isMandatory?: boolean;
+  visibleToClient?: boolean;
+  expectedDocumentType?: string;
+  sectionGroup?: string;
+  sortOrder?: number;
+  dropdownOptions?: { options: string[] };
+}
+
+export interface ItemOrder {
+  itemId: string;
+  sortOrder: number;
+}
+
+export interface ChecklistTemplate {
+  id: string;
+  name: string;
+  category: string;
+  description?: string;
+  isActive: boolean;
+  expectedTatDays?: number;
+  createdAt: Date;
+  updatedAt: Date;
+  items?: ChecklistTemplateItem[];
+  serviceAssociations?: any[];
+}
+
+export interface ChecklistTemplateItem {
+  id: string;
+  templateId: string;
+  itemCode: string;
+  label: string;
+  type: string;
+  helpText?: string;
+  isMandatory: boolean;
+  visibleToClient: boolean;
+  expectedDocumentType?: string;
+  sectionGroup?: string;
+  sortOrder: number;
+  dropdownOptions?: any;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Checklist Template Management Service
+ * Implements SRS 5.4 - Dynamic Checklist Management
+ */
+export class ChecklistTemplateService {
+
+  /**
+   * Valid checklist categories based on SRS 5.4.1 and 5.12.1 (EcoVadis)
+   */
+  private static readonly VALID_CATEGORIES = [
+    'environment',
+    'labour', 
+    'ethics',
+    'procurement',
+    'other'
+  ];
+
+  /**
+   * Valid item types based on SRS 5.4.2
+   */
+  private static readonly VALID_ITEM_TYPES = [
+    'text',
+    'textarea', 
+    'number',
+    'dropdown',
+    'date',
+    'file',
+    'multi_file',
+    'reference'
+  ];
+
+  /**
+   * Create a new checklist template
+   */
+  async createTemplate(templateData: CreateTemplateDto): Promise<ChecklistTemplate> {
+    this.validateTemplateData(templateData);
+
+    return await prisma.$transaction(async (tx) => {
+      // Check for duplicate template name
+      const existingTemplate = await tx.checklistTemplate.findFirst({
+        where: { name: templateData.name }
+      });
+
+      if (existingTemplate) {
+        throw new AppError(`Template with name '${templateData.name}' already exists`, 400, 'TEMPLATE_EXISTS');
+      }
+
+      // Validate item codes are unique
+      const itemCodes = templateData.items.map(item => item.itemCode);
+      const duplicateCodes = itemCodes.filter((code, index) => itemCodes.indexOf(code) !== index);
+      if (duplicateCodes.length > 0) {
+        throw new AppError(`Duplicate item codes: ${duplicateCodes.join(', ')}`, 400, 'DUPLICATE_ITEM_CODES');
+      }
+
+      // Check for existing item codes in database
+      const existingItems = await tx.checklistTemplateItem.findMany({
+        where: { itemCode: { in: itemCodes } },
+        select: { itemCode: true }
+      });
+
+      if (existingItems.length > 0) {
+        const existingCodes = existingItems.map(item => item.itemCode);
+        throw new AppError(`Item codes already exist: ${existingCodes.join(', ')}`, 400, 'ITEM_CODE_EXISTS');
+      }
+
+      // Create the template
+      const template = await tx.checklistTemplate.create({
+        data: {
+          name: templateData.name,
+          category: templateData.category,
+          description: templateData.description,
+          expectedTatDays: templateData.expectedTatDays,
+          isActive: true
+        }
+      });
+
+      // Create template items
+      const itemsData = templateData.items.map((item, index) => ({
+        templateId: template.id,
+        itemCode: item.itemCode,
+        label: item.label,
+        type: item.type,
+        helpText: item.helpText,
+        isMandatory: item.isMandatory,
+        visibleToClient: item.visibleToClient,
+        expectedDocumentType: item.expectedDocumentType,
+        sectionGroup: item.sectionGroup,
+        sortOrder: item.sortOrder || index,
+        dropdownOptions: item.dropdownOptions ? JSON.stringify(item.dropdownOptions) : null
+      }));
+
+      await tx.checklistTemplateItem.createMany({
+        data: itemsData
+      });
+
+      // Associate with services if provided
+      if (templateData.serviceIds && templateData.serviceIds.length > 0) {
+        await this.associateWithServices(template.id, templateData.serviceIds, tx);
+      }
+
+      logger.info(`Created checklist template: ${template.name} with ${templateData.items.length} items`);
+
+      // Return template with items
+      return await tx.checklistTemplate.findUnique({
+        where: { id: template.id },
+        include: {
+          items: {
+            orderBy: { sortOrder: 'asc' }
+          },
+          serviceAssociations: {
+            include: { service: true }
+          }
+        }
+      });
+    });
+  }
+
+  /**
+   * Update an existing template
+   */
+  async updateTemplate(id: string, updates: UpdateTemplateDto): Promise<ChecklistTemplate> {
+    if (updates.category && !ChecklistTemplateService.VALID_CATEGORIES.includes(updates.category)) {
+      throw new AppError(`Invalid category: ${updates.category}`, 400, 'INVALID_CATEGORY');
+    }
+
+    const template = await prisma.checklistTemplate.update({
+      where: { id },
+      data: updates,
+      include: {
+        items: {
+          orderBy: { sortOrder: 'asc' }
+        },
+        serviceAssociations: {
+          include: { service: true }
+        }
+      }
+    });
+
+    logger.info(`Updated checklist template: ${id}`);
+    return template;
+  }
+
+  /**
+   * Get template by ID
+   */
+  async getTemplate(id: string): Promise<ChecklistTemplate | null> {
+    return await prisma.checklistTemplate.findUnique({
+      where: { id },
+      include: {
+        items: {
+          orderBy: { sortOrder: 'asc' }
+        },
+        serviceAssociations: {
+          include: { service: true }
+        }
+      }
+    });
+  }
+
+  /**
+   * Get all templates with optional filtering
+   */
+  async getTemplates(filters?: {
+    category?: string;
+    isActive?: boolean;
+    serviceId?: string;
+  }): Promise<ChecklistTemplate[]> {
+    const where: any = {};
+
+    if (filters?.category) {
+      where.category = filters.category;
+    }
+
+    if (filters?.isActive !== undefined) {
+      where.isActive = filters.isActive;
+    }
+
+    if (filters?.serviceId) {
+      where.serviceAssociations = {
+        some: {
+          serviceId: filters.serviceId
+        }
+      };
+    }
+
+    return await prisma.checklistTemplate.findMany({
+      where,
+      include: {
+        items: {
+          orderBy: { sortOrder: 'asc' }
+        },
+        serviceAssociations: {
+          include: { service: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  /**
+   * Delete a template (soft delete by setting isActive = false)
+   */
+  async deleteTemplate(id: string): Promise<void> {
+    const template = await prisma.checklistTemplate.findUnique({
+      where: { id },
+      include: { 
+        projectChecklists: true 
+      }
+    });
+
+    if (!template) {
+      throw new AppError('Template not found', 404, 'TEMPLATE_NOT_FOUND');
+    }
+
+    // Check if template is in use by any projects
+    if (template.projectChecklists.length > 0) {
+      throw new AppError(
+        'Cannot delete template that is used in projects. Deactivate it instead.',
+        400,
+        'TEMPLATE_IN_USE'
+      );
+    }
+
+    // Soft delete by setting isActive = false
+    await prisma.checklistTemplate.update({
+      where: { id },
+      data: { isActive: false }
+    });
+
+    logger.info(`Deactivated checklist template: ${id}`);
+  }
+
+  /**
+   * Add a new item to a template
+   */
+  async addTemplateItem(templateId: string, itemData: CreateTemplateItemDto): Promise<ChecklistTemplateItem> {
+    this.validateItemData(itemData);
+
+    // Check if item code already exists
+    const existingItem = await prisma.checklistTemplateItem.findUnique({
+      where: { itemCode: itemData.itemCode }
+    });
+
+    if (existingItem) {
+      throw new AppError(`Item code '${itemData.itemCode}' already exists`, 400, 'ITEM_CODE_EXISTS');
+    }
+
+    const item = await prisma.checklistTemplateItem.create({
+      data: {
+        templateId,
+        itemCode: itemData.itemCode,
+        label: itemData.label,
+        type: itemData.type,
+        helpText: itemData.helpText,
+        isMandatory: itemData.isMandatory,
+        visibleToClient: itemData.visibleToClient,
+        expectedDocumentType: itemData.expectedDocumentType,
+        sectionGroup: itemData.sectionGroup,
+        sortOrder: itemData.sortOrder || 0,
+        dropdownOptions: itemData.dropdownOptions ? JSON.stringify(itemData.dropdownOptions) : null
+      }
+    });
+
+    logger.info(`Added item ${itemData.itemCode} to template ${templateId}`);
+    return item;
+  }
+
+  /**
+   * Update a template item
+   */
+  async updateTemplateItem(templateId: string, itemId: string, updates: UpdateTemplateItemDto): Promise<ChecklistTemplateItem> {
+    if (updates.type && !ChecklistTemplateService.VALID_ITEM_TYPES.includes(updates.type)) {
+      throw new AppError(`Invalid item type: ${updates.type}`, 400, 'INVALID_ITEM_TYPE');
+    }
+
+    const updateData: any = { ...updates };
+    if (updates.dropdownOptions) {
+      updateData.dropdownOptions = JSON.stringify(updates.dropdownOptions);
+    }
+
+    const item = await prisma.checklistTemplateItem.update({
+      where: { 
+        id: itemId,
+        templateId // Ensure item belongs to the template
+      },
+      data: updateData
+    });
+
+    logger.info(`Updated item ${itemId} in template ${templateId}`);
+    return item;
+  }
+
+  /**
+   * Delete a template item
+   */
+  async deleteTemplateItem(templateId: string, itemId: string): Promise<void> {
+    // Check if item is used in any project checklists
+    const usageCount = await prisma.projectChecklistItem.count({
+      where: {
+        templateItemId: itemId
+      }
+    });
+
+    if (usageCount > 0) {
+      throw new AppError(
+        'Cannot delete item that is used in project checklists',
+        400,
+        'ITEM_IN_USE'
+      );
+    }
+
+    await prisma.checklistTemplateItem.delete({
+      where: { 
+        id: itemId,
+        templateId // Ensure item belongs to the template
+      }
+    });
+
+    logger.info(`Deleted item ${itemId} from template ${templateId}`);
+  }
+
+  /**
+   * Reorder template items
+   */
+  async reorderTemplateItems(templateId: string, itemOrders: ItemOrder[]): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+      for (const { itemId, sortOrder } of itemOrders) {
+        await tx.checklistTemplateItem.update({
+          where: { 
+            id: itemId,
+            templateId // Ensure item belongs to the template
+          },
+          data: { sortOrder }
+        });
+      }
+    });
+
+    logger.info(`Reordered ${itemOrders.length} items in template ${templateId}`);
+  }
+
+  /**
+   * Associate template with services
+   */
+  async associateWithServices(templateId: string, serviceIds: string[], tx?: any): Promise<void> {
+    const db = tx || prisma;
+
+    // Remove existing associations
+    await db.serviceChecklistTemplate.deleteMany({
+      where: { templateId }
+    });
+
+    // Create new associations
+    const associations = serviceIds.map(serviceId => ({
+      templateId,
+      serviceId,
+      isRequired: true
+    }));
+
+    await db.serviceChecklistTemplate.createMany({
+      data: associations
+    });
+
+    logger.info(`Associated template ${templateId} with services: ${serviceIds.join(', ')}`);
+  }
+
+  /**
+   * Get templates by service ID
+   */
+  async getTemplatesByService(serviceId: string): Promise<ChecklistTemplate[]> {
+    return await prisma.checklistTemplate.findMany({
+      where: {
+        serviceAssociations: {
+          some: {
+            serviceId,
+            isRequired: true
+          }
+        },
+        isActive: true
+      },
+      include: {
+        items: {
+          orderBy: { sortOrder: 'asc' }
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+  }
+
+  /**
+   * Clone a template with a new name
+   */
+  async cloneTemplate(sourceTemplateId: string, newName: string): Promise<ChecklistTemplate> {
+    return await prisma.$transaction(async (tx) => {
+      const sourceTemplate = await tx.checklistTemplate.findUnique({
+        where: { id: sourceTemplateId },
+        include: {
+          items: true,
+          serviceAssociations: true
+        }
+      });
+
+      if (!sourceTemplate) {
+        throw new AppError('Source template not found', 404, 'TEMPLATE_NOT_FOUND');
+      }
+
+      // Create new template
+      const newTemplate = await tx.checklistTemplate.create({
+        data: {
+          name: newName,
+          category: sourceTemplate.category,
+          description: `Cloned from ${sourceTemplate.name}`,
+          expectedTatDays: sourceTemplate.expectedTatDays,
+          isActive: true
+        }
+      });
+
+      // Clone items with new item codes
+      for (const item of sourceTemplate.items) {
+        const newItemCode = `${item.itemCode}_CLONE_${Date.now()}`;
+        
+        await tx.checklistTemplateItem.create({
+          data: {
+            templateId: newTemplate.id,
+            itemCode: newItemCode,
+            label: item.label,
+            type: item.type,
+            helpText: item.helpText,
+            isMandatory: item.isMandatory,
+            visibleToClient: item.visibleToClient,
+            expectedDocumentType: item.expectedDocumentType,
+            sectionGroup: item.sectionGroup,
+            sortOrder: item.sortOrder,
+            dropdownOptions: item.dropdownOptions
+          }
+        });
+      }
+
+      logger.info(`Cloned template ${sourceTemplateId} as ${newName}`);
+
+      return await tx.checklistTemplate.findUnique({
+        where: { id: newTemplate.id },
+        include: {
+          items: {
+            orderBy: { sortOrder: 'asc' }
+          }
+        }
+      });
+    });
+  }
+
+  /**
+   * Validate template data
+   */
+  private validateTemplateData(data: CreateTemplateDto): void {
+    if (!ChecklistTemplateService.VALID_CATEGORIES.includes(data.category)) {
+      throw new AppError(`Invalid category: ${data.category}`, 400, 'INVALID_CATEGORY');
+    }
+
+    if (!data.items || data.items.length === 0) {
+      throw new AppError('Template must have at least one item', 400, 'NO_ITEMS');
+    }
+
+    for (const item of data.items) {
+      this.validateItemData(item);
+    }
+  }
+
+  /**
+   * Validate item data
+   */
+  private validateItemData(data: CreateTemplateItemDto | UpdateTemplateItemDto): void {
+    if ('type' in data && data.type && !ChecklistTemplateService.VALID_ITEM_TYPES.includes(data.type)) {
+      throw new AppError(`Invalid item type: ${data.type}`, 400, 'INVALID_ITEM_TYPE');
+    }
+
+    if ('itemCode' in data && data.itemCode) {
+      // Item code validation: must be uppercase, alphanumeric with underscores
+      if (!/^[A-Z0-9_]+$/.test(data.itemCode)) {
+        throw new AppError(
+          'Item code must be uppercase alphanumeric with underscores only',
+          400,
+          'INVALID_ITEM_CODE'
+        );
+      }
+    }
+
+    if (data.type === 'dropdown' && (!data.dropdownOptions || !data.dropdownOptions.options || data.dropdownOptions.options.length === 0)) {
+      throw new AppError('Dropdown items must have options defined', 400, 'MISSING_DROPDOWN_OPTIONS');
+    }
+  }
+}

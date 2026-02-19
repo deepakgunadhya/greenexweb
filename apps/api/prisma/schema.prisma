@@ -1,0 +1,758 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                      String                 @id @default(uuid())
+  email                   String                 @unique
+  password                String
+  firstName               String                 @map("first_name")
+  lastName                String                 @map("last_name")
+  phone                   String?
+  isActive                Boolean                @default(true) @map("is_active")
+  isVerified              Boolean                @default(false) @map("is_verified")
+  lastLoginAt             DateTime?              @map("last_login_at")
+  createdAt               DateTime               @default(now()) @map("created_at")
+  updatedAt               DateTime               @updatedAt @map("updated_at")
+  dashboardPreferences    Json?                  @map("dashboard_preferences")
+  leadId                  String?                @map("lead_id")
+  organizationId          String?                @map("organization_id")
+  userType                String                 @default("INTERNAL") @map("user_type")
+  reviewedSubmissions     ClientSubmission[]     @relation("SubmissionReviewer")
+  uploadedSubmissions     ClientSubmission[]     @relation("SubmissionUploader")
+  assignedTemplates       ProjectTemplateAssignment[] @relation("TemplateAssignedTo")
+  deletedContacts         Contact[]              @relation("Contact_deletedBy")
+  conversationReads       ConversationRead[]
+  conversationsAsUserOne  Conversation[]         @relation("UserOneConversation")
+  conversationsAsUserTwo  Conversation[]         @relation("UserTwoConversation")
+  groupMembers            GroupMember[]
+  ownedGroups             Group[]
+  deletedGroups           Group[]                @relation("Group_deletedBy")
+  deletedLeads            Lead[]                 @relation("Lead_deletedBy")
+  stageChangedLeads       Lead[]                 @relation("Lead_stageChangedBy")
+  organizedMeetings       Meeting[]              @relation("Meeting_organizer")
+  Message                 Message[]
+  deletedOrganizations    Organization[]         @relation("Organization_deletedBy")
+  assignedTasks           ProjectTask[]          @relation("TaskAssignee")
+  createdTasks            ProjectTask[]          @relation("TaskCreator")
+  unlockRequests          TaskUnlockRequest[]    @relation("UnlockRequestor")
+  reviewedUnlocks         TaskUnlockRequest[]    @relation("UnlockReviewer")
+  statusChangedProjects   Project[]              @relation("ProjectStatusChanger")
+  quotationActions        QuotationAction[]
+  quotationOtps           QuotationOtp[]
+  approvedQuotations      Quotation[]            @relation("QuotationApprover")
+  statusChangedQuotations Quotation[]            @relation("QuotationStatusChanger")
+  uploadedQuotations      Quotation[]            @relation("QuotationUploader")
+  roles                   UserRole[]
+  lead                    Lead?                  @relation("UserLead", fields: [leadId], references: [id])
+  organization            Organization?          @relation("UserOrganization", fields: [organizationId], references: [id])
+
+  @@index([email])
+  @@map("users")
+}
+
+model Role {
+  id          String     @id @default(uuid())
+  name        String     @unique
+  description String?
+  permissions String
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+model Organization {
+  id          String    @id @default(uuid())
+  name        String
+  type        String
+  industry    String?
+  website     String?
+  phone       String?
+  email       String?
+  address     String?
+  city        String?
+  state       String?
+  country     String?
+  postalCode  String?   @map("postal_code")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+  deletedById String?   @map("deleted_by")
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  contacts    Contact[]
+  leads       Lead[]
+  deletedBy   User?     @relation("Organization_deletedBy", fields: [deletedById], references: [id])
+  projects    Project[]
+  users       User[]    @relation("UserOrganization")
+
+  @@index([type])
+  @@map("organizations")
+}
+
+model Contact {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  firstName      String       @map("first_name")
+  lastName       String       @map("last_name")
+  email          String?
+  phone          String?
+  position       String?
+  isPrimary      Boolean      @default(false) @map("is_primary")
+  isActive       Boolean      @default(true) @map("is_active")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+  deletedAt      DateTime?    @map("deleted_at")
+  deletedById    String?      @map("deleted_by")
+  isDeleted      Boolean      @default(false) @map("is_deleted")
+  deletedBy      User?        @relation("Contact_deletedBy", fields: [deletedById], references: [id])
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leads          Lead[]
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("contacts")
+}
+
+model Lead {
+  id                String       @id @default(uuid())
+  organizationId    String       @map("organization_id")
+  contactId         String?      @map("contact_id")
+  source            String
+  status            String       @default("NEW")
+  title             String
+  description       String?
+  estimatedValue    Decimal?     @map("estimated_value")
+  probability       Int?
+  expectedCloseDate DateTime?    @map("expected_close_date")
+  actualCloseDate   DateTime?    @map("actual_close_date")
+  notes             String?
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  deletedAt         DateTime?    @map("deleted_at")
+  deletedById       String?      @map("deleted_by")
+  isDeleted         Boolean      @default(false) @map("is_deleted")
+  businessStage     String       @default("INITIAL") @map("business_stage")
+  companyName       String?      @map("company_name")
+  contactEmail      String?      @map("contact_email")
+  contactName       String?      @map("contact_name")
+  contactPhone      String?      @map("contact_phone")
+  contactPosition   String?      @map("contact_position")
+  meetingStatus     String?      @map("meeting_status")
+  requiresMeeting   Boolean      @default(true) @map("requires_meeting")
+  stageChangedAt    DateTime?    @map("stage_changed_at")
+  stageChangedById  String?      @map("stage_changed_by")
+  contact           Contact?     @relation(fields: [contactId], references: [id])
+  deletedBy         User?        @relation("Lead_deletedBy", fields: [deletedById], references: [id])
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  stageChangedBy    User?        @relation("Lead_stageChangedBy", fields: [stageChangedById], references: [id])
+  meetings          Meeting[]
+  quotations        Quotation[]
+  users             User[]       @relation("UserLead")
+
+  @@index([status])
+  @@index([source])
+  @@index([businessStage])
+  @@index([meetingStatus])
+  @@map("leads")
+}
+
+model Meeting {
+  id               String    @id @default(uuid())
+  leadId           String    @map("lead_id")
+  title            String
+  description      String?
+  scheduledAt      DateTime? @map("scheduled_at")
+  startTime        DateTime? @map("start_time")
+  endTime          DateTime? @map("end_time")
+  duration         Int?
+  location         String?
+  meetingLink      String?   @map("meeting_link")
+  meetingType      String    @default("KICKOFF") @map("meeting_type")
+  status           String    @default("SCHEDULED")
+  outcome          String?
+  actionItems      String?   @map("action_items")
+  organizedBy      String    @map("organized_by")
+  attendees        String?
+  clientSide       String?   @map("client_side")
+  greenexSide      String?   @map("greenex_side")
+  followUpRequired Boolean   @default(false) @map("follow_up_required")
+  followUpDate     DateTime? @map("follow_up_date")
+  followUpNotes    String?   @map("follow_up_notes")
+  calendarEventId  String?   @map("calendar_event_id")
+  reminderSent     Boolean   @default(false) @map("reminder_sent")
+  isDeleted        Boolean   @default(false) @map("is_deleted")
+  deletedAt        DateTime? @map("deleted_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  lead             Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  organizer        User      @relation("Meeting_organizer", fields: [organizedBy], references: [id], onDelete: Cascade)
+
+  @@index([leadId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([meetingType])
+  @@map("meetings")
+}
+
+model Quotation {
+  id               String            @id @default(uuid())
+  leadId           String            @map("lead_id")
+  title            String
+  documentPath     String?           @map("document_path")
+  originalFileName String?           @map("original_file_name")
+  fileSize         Int?              @map("file_size")
+  status           String            @default("DRAFT")
+  sentAt           DateTime?         @map("sent_at")
+  isDeleted        Boolean           @default(false) @map("is_deleted")
+  deletedAt        DateTime?         @map("deleted_at")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  amount           Decimal?
+  notes            String?
+  statusChangedAt  DateTime?         @map("status_changed_at")
+  statusChangedBy  String?           @map("status_changed_by")
+  uploadedBy       String?           @map("uploaded_by")
+  approved_at      DateTime?
+  approved_by      String?
+  client_notes     String?
+  currency         String            @default("INR")
+  description      String?
+  internal_notes   String?
+  is_latest        Boolean           @default(true)
+  mime_type        String?
+  previous_version String?
+  quotation_number String            @unique
+  rejection_reason String?
+  responded_at     DateTime?
+  valid_until      DateTime
+  version          Int               @default(1)
+  viewed_at        DateTime?
+  projects         Project[]
+  actions          QuotationAction[]
+  otps             QuotationOtp[]
+  approver         User?             @relation("QuotationApprover", fields: [approved_by], references: [id])
+  lead             Lead              @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  statusChanger    User?             @relation("QuotationStatusChanger", fields: [statusChangedBy], references: [id])
+  uploader         User?             @relation("QuotationUploader", fields: [uploadedBy], references: [id])
+
+  @@index([leadId])
+  @@index([status])
+  @@index([quotation_number])
+  @@index([valid_until])
+  @@map("quotations")
+}
+
+model Service {
+  id              String           @id @default(uuid())
+  name            String
+  description     String?
+  category        String
+  basePrice       Decimal?         @map("base_price")
+  unit            String?
+  isActive        Boolean          @default(true) @map("is_active")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  projectServices ProjectService[]
+  tasks           ProjectTask[]
+
+  @@index([category])
+  @@index([isActive])
+  @@map("services")
+}
+
+model Project {
+  id                  String                      @id @default(uuid())
+  organizationId      String                      @map("organization_id")
+  projectNumber       String                      @unique @map("project_number")
+  name                String
+  description         String?
+  status              String                      @default("planned")
+  startDate           DateTime?                   @map("start_date")
+  endDate             DateTime?                   @map("end_date")
+  estimatedCost       Decimal?                    @map("estimated_cost")
+  actualCost          Decimal?                    @map("actual_cost")
+  notes               String?
+  createdAt           DateTime                    @default(now()) @map("created_at")
+  updatedAt           DateTime                    @updatedAt @map("updated_at")
+  clientReviewStatus  String                      @default("not_started") @map("client_review_status")
+  executionStatus     String                      @default("not_started") @map("execution_status")
+  paymentStatus       String                      @default("pending") @map("payment_status")
+  quotationId         String                      @map("quotation_id")
+  statusChangedAt     DateTime?                   @map("status_changed_at")
+  statusChangedBy     String?                     @map("status_changed_by")
+  verificationStatus  String                      @default("pending") @map("verification_status")
+  poNumber            String?                     @map("po_number")
+  poAttachmentPath    String?                     @map("po_attachment_path")
+  poAttachmentOriginalName String?                @map("po_attachment_original_name")
+  poAttachmentMimeType String?                    @map("po_attachment_mime_type")
+  poAttachmentSize    BigInt?                     @map("po_attachment_size")
+  projectServices     ProjectService[]
+  tasks               ProjectTask[]
+  templateAssignments ProjectTemplateAssignment[]
+  organization        Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  quotation           Quotation                   @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  statusChanger       User?                       @relation("ProjectStatusChanger", fields: [statusChangedBy], references: [id])
+
+  @@index([status])
+  @@index([verificationStatus])
+  @@index([executionStatus])
+  @@index([clientReviewStatus])
+  @@index([paymentStatus])
+  @@index([projectNumber])
+  @@index([organizationId])
+  @@index([quotationId])
+  @@map("projects")
+}
+
+model ProjectService {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  serviceId String   @map("service_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, serviceId])
+  @@map("project_services")
+}
+
+model ProjectTask {
+  id             String   @id @default(uuid())
+  projectId      String?  @map("project_id")
+  assigneeId     String?  @map("assignee_id")
+  createdById    String   @map("created_by_id")
+  title          String
+  description    String?
+  status         String   @default("to_do")
+  priority       String   @default("medium")
+  dueDate        DateTime? @map("due_date")
+  completedAt    DateTime? @map("completed_at")
+  estimatedHours Int?     @map("estimated_hours")
+  actualHours    Int?     @map("actual_hours")
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  blockedReason  String?  @map("blocked_reason")
+  checklistLink  String?  @map("checklist_link")
+  serviceId      String?  @map("service_id")
+  slaStatus      String   @default("on_track") @map("sla_status")
+  taskType       String   @default("project") @map("task_type")
+  isLocked       Boolean  @default(false) @map("is_locked")
+  lockedAt       DateTime? @map("locked_at")
+  assignee       User?    @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  createdBy      User     @relation("TaskCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  project        Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  service        Service? @relation(fields: [serviceId], references: [id])
+  unlockRequests TaskUnlockRequest[]
+
+  @@index([projectId])
+  @@index([assigneeId])
+  @@index([status])
+  @@index([slaStatus])
+  @@index([dueDate])
+  @@index([taskType])
+  @@index([isLocked])
+  @@map("project_tasks")
+}
+
+model TaskUnlockRequest {
+  id            String    @id @default(uuid())
+  taskId        String    @map("task_id")
+  requestedById String    @map("requested_by_id")
+  reason        String
+  status        String    @default("pending")
+  reviewedById  String?   @map("reviewed_by_id")
+  reviewedAt    DateTime? @map("reviewed_at")
+  reviewNote    String?   @map("review_note")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  task          ProjectTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  requestedBy   User        @relation("UnlockRequestor", fields: [requestedById], references: [id])
+  reviewedBy    User?       @relation("UnlockReviewer", fields: [reviewedById], references: [id])
+
+  @@index([taskId])
+  @@index([status])
+  @@index([requestedById])
+  @@map("task_unlock_requests")
+}
+
+model ChecklistTemplateFile {
+  id                 String                            @id @default(uuid())
+  title              String
+  description        String?
+  category           String
+  clientVisible      Boolean                           @default(true) @map("client_visible")
+  createdBy          String?                           @map("created_by")
+  createdAt          DateTime                          @default(now()) @map("created_at")
+  updatedAt          DateTime                          @updatedAt @map("updated_at")
+  attachments        ChecklistTemplateFileAttachment[]
+  projectAssignments ProjectTemplateAssignment[]
+
+  @@index([category])
+  @@map("checklist_template_files")
+}
+
+model ChecklistTemplateFileAttachment {
+  id             String                @id @default(uuid())
+  templateFileId String                @map("template_file_id")
+  filePath       String                @map("file_path")
+  originalName   String                @map("original_name")
+  fileSize       BigInt?               @map("file_size")
+  mimeType       String?               @map("mime_type")
+  sortOrder      Int                   @default(0) @map("sort_order")
+  uploadedBy     String?               @map("uploaded_by")
+  uploadedAt     DateTime              @default(now()) @map("uploaded_at")
+  templateFile   ChecklistTemplateFile @relation(fields: [templateFileId], references: [id], onDelete: Cascade)
+
+  @@index([templateFileId])
+  @@map("checklist_template_file_attachments")
+}
+
+model ProjectTemplateAssignment {
+  id             String                @id @default(uuid())
+  projectId      String                @map("project_id")
+  templateFileId String                @map("template_file_id")
+  status         String                @default("assigned")
+  assignedBy     String?               @map("assigned_by")
+  assignedAt     DateTime              @default(now()) @map("assigned_at")
+  verifiedBy     String?               @map("verified_by")
+  verifiedAt     DateTime?             @map("verified_at")
+  currentRemarks   String?               @map("current_remarks")
+  assignedToUserId String?               @map("assigned_to_user_id")
+  submissions      ClientSubmission[]
+  project          Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  templateFile     ChecklistTemplateFile @relation(fields: [templateFileId], references: [id], onDelete: Cascade)
+  assignedToUser   User?                 @relation("TemplateAssignedTo", fields: [assignedToUserId], references: [id])
+
+  @@unique([projectId, templateFileId])
+  @@index([projectId])
+  @@index([templateFileId])
+  @@index([status])
+  @@index([assignedToUserId])
+  @@map("project_template_assignments")
+}
+
+model ClientSubmission {
+  id            String                    @id @default(uuid())
+  assignmentId  String                    @map("assignment_id")
+  version       Int                       @default(1)
+  filePath      String                    @map("file_path")
+  originalName  String                    @map("original_name")
+  fileSize      BigInt?                   @map("file_size")
+  mimeType      String?                   @map("mime_type")
+  status        String                    @default("submitted")
+  uploadedBy    String                    @map("uploaded_by")
+  uploadedAt    DateTime                  @default(now()) @map("uploaded_at")
+  reviewedBy    String?                   @map("reviewed_by")
+  reviewedAt    DateTime?                 @map("reviewed_at")
+  reviewRemarks String?                   @map("review_remarks")
+  clientComment    String?                   @map("client_comment")
+  isLatest         Boolean                   @default(true) @map("is_latest")
+  submissionSource String                    @default("client") @map("submission_source")
+  assignment       ProjectTemplateAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  reviewer      User?                     @relation("SubmissionReviewer", fields: [reviewedBy], references: [id])
+  uploader      User                      @relation("SubmissionUploader", fields: [uploadedBy], references: [id])
+
+  @@index([assignmentId])
+  @@index([version])
+  @@index([status])
+  @@index([isLatest])
+  @@map("client_submissions")
+}
+
+model Category {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  description String?
+  slug        String    @unique
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  content     Content[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("categories")
+}
+
+model Tag {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  slug        String       @unique
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  contentTags ContentTag[]
+
+  @@index([slug])
+  @@map("tags")
+}
+
+model Content {
+  id           String       @id @default(uuid())
+  type         String
+  title        String
+  slug         String       @unique
+  summary      String?
+  content      String?
+  thumbnailUrl String?      @map("thumbnail_url")
+  imageUrl     String?      @map("image_url")
+  videoUrl     String?      @map("video_url")
+  videoThumb   String?      @map("video_thumbnail")
+  categoryId   String       @map("category_id")
+  authorName   String       @map("author_name")
+  publishDate  DateTime?    @map("publish_date")
+  status       String       @default("DRAFT")
+  isPublic     Boolean      @default(true) @map("is_public")
+  isFeatured   Boolean      @default(false) @map("is_featured")
+  isTraining   Boolean      @default(false) @map("is_training")
+  eventDate    DateTime?    @map("event_date")
+  eventLink    String?      @map("event_link")
+  showInApp    Boolean      @default(true) @map("show_in_app")
+  isDeleted    Boolean      @default(false) @map("is_deleted")
+  deletedAt    DateTime?    @map("deleted_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+  category     Category     @relation(fields: [categoryId], references: [id])
+  contentTags  ContentTag[]
+
+  @@index([type])
+  @@index([status])
+  @@index([slug])
+  @@index([categoryId])
+  @@index([publishDate])
+  @@index([isFeatured])
+  @@index([isTraining])
+  @@index([showInApp])
+  @@map("content")
+}
+
+model ContentTag {
+  id        String   @id @default(uuid())
+  contentId String   @map("content_id")
+  tagId     String   @map("tag_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  content   Content  @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([contentId, tagId])
+  @@map("content_tags")
+}
+
+model GoogleAuth {
+  id           String   @id @default(uuid())
+  accessToken  String   @map("access_token")
+  refreshToken String?  @map("refresh_token")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  isActive     Boolean  @default(true) @map("is_active")
+  email        String?
+  userId       String   @unique @map("user_id")
+
+  @@index([userId])
+  @@map("google_auth")
+}
+
+model DeviceToken {
+  id         String           @id @default(uuid())
+  userId     String?          @map("user_id")
+  type       NotificationType
+  token      String           @unique
+  platform   Platform
+  deviceId   String           @map("device_id")
+  deviceInfo Json?            @map("device_info")
+  isActive   Boolean          @default(true) @map("is_active")
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+  lastUsedAt DateTime         @default(now()) @map("last_used_at")
+
+  @@index([userId])
+  @@index([token])
+  @@index([isActive])
+  @@map("device_tokens")
+}
+
+model QuotationOtp {
+  id          String    @id @default(uuid())
+  quotationId String    @map("quotation_id")
+  userId      String    @map("user_id")
+  otpCode     String    @map("otp_code")
+  actionType  String    @map("action_type")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  expiresAt   DateTime  @map("expires_at")
+  usedAt      DateTime? @map("used_at")
+  isUsed      Boolean   @default(false) @map("is_used")
+  attempts    Int       @default(0)
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([quotationId])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("quotation_otps")
+}
+
+model QuotationAction {
+  id          String    @id @default(uuid())
+  quotationId String    @map("quotation_id")
+  userId      String    @map("user_id")
+  action      String
+  reason      String?
+  ipAddress   String?   @map("ip_address")
+  userAgent   String?   @map("user_agent")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([quotationId])
+  @@index([userId])
+  @@index([action])
+  @@map("quotation_actions")
+}
+
+model Group {
+  id            String         @id @default(uuid())
+  name          String
+  description   String?
+  avatar        String?
+  createdBy     String         @map("created_by")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  isDeleted     Boolean        @default(false) @map("is_deleted")
+  deletedAt     DateTime?      @map("deleted_at")
+  deletedById   String?        @map("deleted_by")
+  conversations Conversation[]
+  members       GroupMember[]
+  owner         User           @relation(fields: [createdBy], references: [id])
+  deletedBy     User?          @relation("Group_deletedBy", fields: [deletedById], references: [id])
+
+  @@map("groups")
+}
+
+model GroupMember {
+  id        String          @id @default(uuid())
+  groupId   String          @map("group_id")
+  userId    String          @map("user_id")
+  role      GroupMemberRole @default(MEMBER)
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+  group     Group           @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@map("group_members")
+}
+
+model Conversation {
+  id        String             @id @default(uuid())
+  type      ConversationType
+  userOneId String?
+  userTwoId String?
+  groupId   String?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+  reads     ConversationRead[]
+  group     Group?             @relation(fields: [groupId], references: [id])
+  userOne   User?              @relation("UserOneConversation", fields: [userOneId], references: [id])
+  userTwo   User?              @relation("UserTwoConversation", fields: [userTwoId], references: [id])
+  messages  Message[]
+
+  @@map("conversations")
+}
+
+model ConversationRead {
+  id             String       @id @default(uuid())
+  conversationId String
+  userId         String
+  lastReadAt     DateTime     @default(now())
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@unique([conversationId, userId])
+  @@index([conversationId])
+  @@index([userId])
+  @@map("conversation_reads")
+}
+
+model Message {
+  id             String          @id @default(uuid())
+  conversationId String          @map("conversation_id")
+  senderId       String          @map("sender_id")
+  content        String?
+  attachmentUrl  String?         @map("attachment_url")
+  attachmentType AttachmentType? @map("attachment_type")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  conversation   Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User            @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([senderId])
+  @@map("messages")
+}
+
+enum Platform {
+  ANDROID
+  IOS
+  WEB
+}
+
+enum NotificationType {
+  user
+  broadcast
+  topic
+  scheduled
+}
+
+enum GroupMemberRole {
+  MEMBER
+  ADMIN
+}
+
+enum ConversationType {
+  DIRECT
+  GROUP
+}
+
+model CommonReminderLog {
+  id         String   @id @default(uuid())
+  entityId   String   @map("entity_id")
+  entityType String   @map("entity_type")
+  type       String   @map("type")
+  sentAt     DateTime @default(now()) @map("sent_at")
+  sentDate   String   @map("sent_date")
+  recipients String[]
+
+  @@unique([entityId, entityType, type, sentDate])
+  @@index([sentDate])
+  @@map("common_reminder_logs")
+}
+
+enum AttachmentType {
+  image
+  file
+}

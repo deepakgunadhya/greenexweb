@@ -1,0 +1,1429 @@
+import prisma from '../../config/database';
+import { AppError } from '../../middleware/error.middleware';
+import { logger } from '../../utils/logger';
+
+export interface ProjectChecklistWithItems {
+  id: string;
+  projectId: string;
+  templateId: string;
+  version: number;
+  status: string;
+  completenessPercent: number | any; // Allow Decimal type from Prisma
+  createdAt: Date;
+  updatedAt: Date;
+  verifiedBy?: string;
+  verifiedAt?: Date;
+  verificationComments?: string;
+  template: {
+    id: string;
+    name: string;
+    category: string;
+    expectedTatDays?: number;
+  };
+  items: ProjectChecklistItemWithDetails[];
+}
+
+export interface ProjectChecklistItemWithDetails {
+  id: string;
+  checklistId: string;
+  templateItemId: string;
+  valueText?: string;
+  valueNumber?: number | any; // Allow Decimal type from Prisma
+  valueDate?: Date;
+  valueBoolean?: boolean;
+  verifiedStatus: string;
+  verifierComment?: string;
+  filledBy?: string;
+  filledAt?: Date;
+  templateItem: {
+    id: string;
+    itemCode: string;
+    label: string;
+    type: string;
+    isMandatory: boolean;
+    visibleToClient: boolean;
+    expectedDocumentType?: string;
+    sectionGroup?: string;
+    sortOrder: number;
+    dropdownOptions?: any;
+  };
+  files: ChecklistItemFile[];
+}
+
+export interface ChecklistItemFile {
+  id: string;
+  filePath: string;
+  originalName: string;
+  fileSize?: bigint | any; // Allow for different types from Prisma
+  mimeType?: string;
+  version: number;
+  uploadedBy: string;
+  uploadedAt: Date;
+}
+
+export interface CreateProjectChecklistDto {
+  projectId: string;
+  templateId: string;
+}
+
+export interface UpdateChecklistItemDto {
+  valueText?: string;
+  valueNumber?: number;
+  valueDate?: Date;
+  valueBoolean?: boolean;
+  filledBy: string;
+}
+
+export interface VerifyChecklistDto {
+  verifiedBy: string;
+  verificationComments?: string;
+  itemVerifications: {
+    itemId: string;
+    verifiedStatus: 'accepted' | 'needs_clarification';
+    verifierComment?: string;
+  }[];
+}
+
+export interface CompletenessCalculation {
+  totalItems: number;
+  mandatoryItems: number;
+  filledMandatory: number;
+  completenessPercent: number;
+  missingMandatoryItems: string[];
+}
+
+/**
+ * Project Checklist Management Service
+ * Implements SRS 5.4 - Dynamic Checklist Management (Project Instance)
+ */
+export class ProjectChecklistService {
+
+  /**
+   * Create checklist instances for a project based on its services
+   * SRS 5.4.3 - Auto-instantiation when project status changes to checklist_finalized
+   */
+  async createChecklistsForProject(projectId: string): Promise<ProjectChecklistWithItems[]> {
+    return await prisma.$transaction(async (tx) => {
+      // Get project with its services
+      const project = await tx.project.findUnique({
+        where: { id: projectId },
+        include: {
+          projectServices: {
+            include: {
+              service: {
+                include: {
+                  checklistAssociations: {
+                    where: { isRequired: true },
+                    include: {
+                      template: {
+                        include: { items: true }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      if (!project) {
+        throw new AppError('Project not found', 404, 'PROJECT_NOT_FOUND');
+      }
+
+      // Check if checklists already exist
+      const existingChecklists = await tx.projectChecklist.findMany({
+        where: { projectId }
+      });
+
+      if (existingChecklists.length > 0) {
+        throw new AppError('Checklists already exist for this project', 400, 'CHECKLISTS_EXIST');
+      }
+
+      const createdChecklists: ProjectChecklistWithItems[] = [];
+      
+      // Collect all required templates across all services
+      const requiredTemplates = new Map<string, any>();
+      
+      for (const projectService of project.projectServices) {
+        for (const association of projectService.service.checklistAssociations) {
+          if (!requiredTemplates.has(association.templateId)) {
+            requiredTemplates.set(association.templateId, association.template);
+          }
+        }
+      }
+
+      // Create checklist instance for each required template
+      for (const [templateId, template] of requiredTemplates) {
+        const checklist = await this.createChecklistInstance(projectId, templateId, tx);
+        createdChecklists.push(checklist);
+      }
+
+      logger.info(`Created ${createdChecklists.length} checklist instances for project ${projectId}`);
+      
+      return createdChecklists;
+    });
+  }
+
+  /**
+   * Create a single checklist instance from a template
+   */
+  async createChecklistInstance(
+    projectId: string, 
+    templateId: string, 
+    tx?: any
+  ): Promise<ProjectChecklistWithItems> {
+    const db = tx || prisma;
+
+    // Get template with items
+    const template = await db.checklistTemplate.findUnique({
+      where: { id: templateId },
+      include: {
+        items: {
+          orderBy: { sortOrder: 'asc' }
+        }
+      }
+    });
+
+    if (!template) {
+      throw new AppError('Template not found', 404, 'TEMPLATE_NOT_FOUND');
+    }
+
+    if (!template.isActive) {
+      throw new AppError('Cannot create checklist from inactive template', 400, 'TEMPLATE_INACTIVE');
+    }
+
+    // Create the project checklist
+    const checklist = await db.projectChecklist.create({
+      data: {
+        projectId,
+        templateId,
+        version: 1,
+        status: 'draft',
+        completenessPercent: 0
+      }
+    });
+
+    // Create checklist items based on template items
+    const itemsData = template.items.map(templateItem => ({
+      checklistId: checklist.id,
+      templateItemId: templateItem.id,
+      verifiedStatus: 'pending'
+    }));
+
+    await db.projectChecklistItem.createMany({
+      data: itemsData
+    });
+
+    // Return the complete checklist with items
+    return await db.projectChecklist.findUnique({
+      where: { id: checklist.id },
+      include: {
+        template: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            expectedTatDays: true
+          }
+        },
+        items: {
+          include: {
+            templateItem: true,
+            files: true
+          },
+          orderBy: {
+            templateItem: {
+              sortOrder: 'asc'
+            }
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * Get checklist with items for a project
+   */
+async getProjectTemplateAssignments(
+  projectId: string,
+  status?: string,
+  version?: number
+) {
+  return prisma.projectTemplateAssignment.findMany({
+    where: {
+      projectId,
+      ...(status ? { status } : {})
+    },
+    include: {
+      templateFile: {
+        select: {
+          id: true,
+          title: true,
+          description: true,
+          category: true,
+          createdAt: true,
+          attachments: {
+            orderBy: { sortOrder: 'asc' },
+            select: {
+              id: true,
+              originalName: true,
+              filePath: true,
+              mimeType: true,
+              // fileSize: true
+            }
+          }
+        }
+      },
+      submissions: {
+        where: version
+          ? { version }
+          : { isLatest: true },
+        orderBy: { version: 'desc' },
+        select: {
+          id: true,
+          version: true,
+          status: true,
+          filePath: true,
+          originalName: true,
+          mimeType: true,
+          uploadedAt: true,
+          reviewedAt: true,
+          reviewRemarks: true,
+          uploader: {
+            select: { id: true, firstName: true, lastName: true }
+          },
+          reviewer: {
+            select: { id: true, firstName: true, lastName: true }
+          }
+        }
+      }
+    },
+    orderBy: [
+      { templateFile: { category: 'asc' } },
+      { assignedAt: 'asc' }
+    ]
+  });
+}
+
+
+  /**
+   * Get single checklist by ID
+   */
+  async getChecklist(checklistId: string): Promise<ProjectChecklistWithItems | null> {
+    return await prisma.projectChecklist.findUnique({
+      where: { id: checklistId },
+      include: {
+        template: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            expectedTatDays: true
+          }
+        },
+        items: {
+          include: {
+            templateItem: true,
+            files: true,
+            filler: {
+              select: { id: true, firstName: true, lastName: true }
+            }
+          },
+          orderBy: {
+            templateItem: {
+              sortOrder: 'asc'
+            }
+          }
+        },
+        verifier: {
+          select: { id: true, firstName: true, lastName: true }
+        }
+      }
+    }) as ProjectChecklistWithItems | null;
+  }
+
+  /**
+   * Update a checklist item value
+   */
+  async updateChecklistItem(
+    itemId: string, 
+    updates: UpdateChecklistItemDto
+  ): Promise<ProjectChecklistItemWithDetails> {
+    return await prisma.$transaction(async (tx) => {
+      // Update the item
+      const updatedItem = await tx.projectChecklistItem.update({
+        where: { id: itemId },
+        data: {
+          ...updates,
+          filledAt: new Date(),
+          verifiedStatus: 'pending' // Reset verification when item is updated
+        },
+        include: {
+          templateItem: true,
+          files: true,
+          checklist: true
+        }
+      });
+
+      // Recalculate completeness for the parent checklist
+      await this.updateChecklistCompleteness(updatedItem.checklistId, tx);
+
+      logger.info(`Updated checklist item ${itemId} with new value`);
+      
+      return updatedItem as ProjectChecklistItemWithDetails;
+    });
+  }
+
+  /**
+   * Calculate and update checklist completeness
+   * SRS 5.4.2 - 100% mandatory completion required for verification
+   */
+  async updateChecklistCompleteness(checklistId: string, tx?: any): Promise<CompletenessCalculation> {
+    const db = tx || prisma;
+
+    const checklist = await db.projectChecklist.findUnique({
+      where: { id: checklistId },
+      include: {
+        items: {
+          include: {
+            templateItem: true,
+            files: true
+          }
+        }
+      }
+    });
+
+    if (!checklist) {
+      throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+    }
+
+    const calculation = this.calculateCompleteness(checklist);
+
+    // Update the checklist completeness
+    await db.projectChecklist.update({
+      where: { id: checklistId },
+      data: {
+        completenessPercent: calculation.completenessPercent,
+        status: calculation.completenessPercent >= 100 ? 'ready_for_verification' : 'in_progress'
+      }
+    });
+
+    return calculation;
+  }
+
+  /**
+   * Calculate completeness percentage based on mandatory fields
+   */
+  private calculateCompleteness(checklist: any): CompletenessCalculation {
+    const mandatoryItems = checklist.items.filter((item: any) => item.templateItem.isMandatory);
+    const totalItems = checklist.items.length;
+    
+    const filledMandatory = mandatoryItems.filter((item: any) => {
+      const templateItem = item.templateItem;
+      
+      switch (templateItem.type) {
+        case 'file':
+        case 'multi_file':
+          return item.files && item.files.length > 0;
+        case 'text':
+        case 'textarea':
+          return item.valueText && item.valueText.trim() !== '';
+        case 'number':
+          return item.valueNumber !== null && item.valueNumber !== undefined;
+        case 'date':
+          return item.valueDate !== null;
+        case 'dropdown':
+          return item.valueText && item.valueText.trim() !== '';
+        case 'reference':
+          return item.valueText && item.valueText.trim() !== '';
+        default:
+          return item.valueText && item.valueText.trim() !== '';
+      }
+    });
+
+    const missingMandatoryItems = mandatoryItems
+      .filter((item: any) => !filledMandatory.includes(item))
+      .map((item: any) => item.templateItem.label);
+
+    const completenessPercent = mandatoryItems.length === 0 
+      ? 100 
+      : Math.round((filledMandatory.length / mandatoryItems.length) * 100);
+
+    return {
+      totalItems,
+      mandatoryItems: mandatoryItems.length,
+      filledMandatory: filledMandatory.length,
+      completenessPercent,
+      missingMandatoryItems
+    };
+  }
+
+  /**
+   * Submit checklist for verification
+   * SRS 5.4.3 - Only 100% complete checklists can be submitted
+   */
+  async submitForVerification(checklistId: string, submittedBy: string): Promise<void> {
+    const completeness = await this.updateChecklistCompleteness(checklistId);
+    
+    if (completeness.completenessPercent < 100) {
+      throw new AppError(
+        `Checklist must be 100% complete before verification. Missing: ${completeness.missingMandatoryItems.join(', ')}`,
+        400,
+        'INCOMPLETE_CHECKLIST'
+      );
+    }
+
+    await prisma.projectChecklist.update({
+      where: { id: checklistId },
+      data: {
+        status: 'ready_for_verification'
+      }
+    });
+
+    logger.info(`Checklist ${checklistId} submitted for verification by ${submittedBy}`);
+  }
+
+  /**
+   * Verify checklist items - QA approval workflow
+   * SRS 5.6 - Verification workflow with item-level approval
+   */
+  async verifyChecklist(
+    checklistId: string, 
+    verificationData: VerifyChecklistDto
+  ): Promise<ProjectChecklistWithItems> {
+    return await prisma.$transaction(async (tx) => {
+      const checklist = await tx.projectChecklist.findUnique({
+        where: { id: checklistId },
+        include: { items: true }
+      });
+
+      if (!checklist) {
+        throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+      }
+
+      if (checklist.status !== 'ready_for_verification') {
+        throw new AppError('Checklist is not ready for verification', 400, 'INVALID_VERIFICATION_STATUS');
+      }
+
+      // Update individual item verifications
+      for (const itemVerification of verificationData.itemVerifications) {
+        await tx.projectChecklistItem.update({
+          where: { id: itemVerification.itemId },
+          data: {
+            verifiedStatus: itemVerification.verifiedStatus,
+            verifierComment: itemVerification.verifierComment
+          }
+        });
+      }
+
+      // Determine overall verification status
+      const allAccepted = verificationData.itemVerifications.every(
+        item => item.verifiedStatus === 'accepted'
+      );
+
+      const checklistStatus = allAccepted ? 'verified_passed' : 'verified_failed';
+
+      // Update checklist verification
+      const updatedChecklist = await tx.projectChecklist.update({
+        where: { id: checklistId },
+        data: {
+          status: checklistStatus,
+          verifiedBy: verificationData.verifiedBy,
+          verifiedAt: new Date(),
+          verificationComments: verificationData.verificationComments
+        },
+        include: {
+          template: {
+            select: {
+              id: true,
+              name: true,
+              category: true,
+              expectedTatDays: true
+            }
+          },
+          items: {
+            include: {
+              templateItem: true,
+              files: true
+            },
+            orderBy: {
+              templateItem: {
+                sortOrder: 'asc'
+              }
+            }
+          }
+        }
+      });
+
+      logger.info(`Checklist ${checklistId} verification completed by ${verificationData.verifiedBy}: ${checklistStatus}`);
+      
+      return updatedChecklist as ProjectChecklistWithItems;
+    });
+  }
+
+  /**
+   * Create new version of checklist (for template updates)
+   * SRS 5.4.4 - Versioning system
+   */
+  async createNewVersion(checklistId: string, reason: string): Promise<ProjectChecklistWithItems> {
+    return await prisma.$transaction(async (tx) => {
+      const currentChecklist = await tx.projectChecklist.findUnique({
+        where: { id: checklistId },
+        include: {
+          items: {
+            include: { files: true }
+          }
+        }
+      });
+
+      if (!currentChecklist) {
+        throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+      }
+
+      // Mark current version as superseded
+      await tx.projectChecklist.update({
+        where: { id: checklistId },
+        data: { status: 'superseded' }
+      });
+
+      // Create new version
+      const newVersion = await tx.projectChecklist.create({
+        data: {
+          projectId: currentChecklist.projectId,
+          templateId: currentChecklist.templateId,
+          version: currentChecklist.version + 1,
+          status: 'draft',
+          completenessPercent: 0
+        }
+      });
+
+      // Copy items from previous version
+      for (const item of currentChecklist.items) {
+        const newItem = await tx.projectChecklistItem.create({
+          data: {
+            checklistId: newVersion.id,
+            templateItemId: item.templateItemId,
+            valueText: item.valueText,
+            valueNumber: item.valueNumber,
+            valueDate: item.valueDate,
+            valueBoolean: item.valueBoolean,
+            verifiedStatus: 'pending'
+          }
+        });
+
+        // Copy files
+        for (const file of item.files) {
+          await tx.checklistItemFile.create({
+            data: {
+              itemId: newItem.id,
+              filePath: file.filePath,
+              originalName: file.originalName,
+              fileSize: file.fileSize,
+              mimeType: file.mimeType,
+              version: file.version,
+              uploadedBy: file.uploadedBy
+            }
+          });
+        }
+      }
+
+      logger.info(`Created new version ${newVersion.version} for checklist ${checklistId}. Reason: ${reason}`);
+
+      // Return the new version with full details
+      const newChecklist = await tx.projectChecklist.findUnique({
+        where: { id: newVersion.id },
+        include: {
+          template: {
+            select: {
+              id: true,
+              name: true,
+              category: true,
+              expectedTatDays: true
+            }
+          },
+          items: {
+            include: {
+              templateItem: true,
+              files: true
+            },
+            orderBy: {
+              templateItem: {
+                sortOrder: 'asc'
+              }
+            }
+          }
+        }
+      });
+      
+      if (!newChecklist) {
+        throw new AppError('Failed to retrieve new checklist version', 500, 'CHECKLIST_CREATE_ERROR');
+      }
+      
+      return newChecklist as ProjectChecklistWithItems;
+    });
+  }
+
+  /**
+   * Get checklist history (all versions)
+   */
+  async getChecklistHistory(projectId: string, templateId: string): Promise<ProjectChecklistWithItems[]> {
+    return await prisma.projectChecklist.findMany({
+      where: {
+        projectId,
+        templateId
+      },
+      include: {
+        template: {
+          select: {
+            id: true,
+            name: true,
+            category: true,
+            expectedTatDays: true
+          }
+        },
+        items: {
+          include: {
+            templateItem: true,
+            files: true
+          },
+          orderBy: {
+            templateItem: {
+              sortOrder: 'asc'
+            }
+          }
+        },
+        verifier: {
+          select: { id: true, firstName: true, lastName: true }
+        }
+      },
+      orderBy: { version: 'desc' }
+    }) as ProjectChecklistWithItems[];
+  }
+
+  /**
+   * Freeze checklist (prevent further changes)
+   * SRS 5.4.4 - Finalization process
+   */
+  async finalizeChecklist(checklistId: string, finalizedBy: string): Promise<void> {
+    const checklist = await prisma.projectChecklist.findUnique({
+      where: { id: checklistId }
+    });
+
+    if (!checklist) {
+      throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+    }
+
+    if (checklist.status !== 'verified_passed') {
+      throw new AppError('Only verified checklists can be finalized', 400, 'INVALID_FINALIZE_STATUS');
+    }
+
+    await prisma.projectChecklist.update({
+      where: { id: checklistId },
+      data: {
+        status: 'finalized'
+      }
+    });
+
+    logger.info(`Checklist ${checklistId} finalized by ${finalizedBy}`);
+  }
+
+  /**
+   * Upload file for checklist item
+   */
+  async uploadFileForItem(
+    itemId: string, 
+    filePath: string, 
+    originalName: string, 
+    fileSize: bigint, 
+    mimeType: string, 
+    uploadedBy: string
+  ): Promise<ChecklistItemFile> {
+    // Check if item exists and is of file type
+    const item = await prisma.projectChecklistItem.findUnique({
+      where: { id: itemId },
+      include: {
+        templateItem: true,
+        files: true
+      }
+    });
+
+    if (!item) {
+      throw new AppError('Checklist item not found', 404, 'ITEM_NOT_FOUND');
+    }
+
+    const isFileType = ['file', 'multi_file'].includes(item.templateItem.type);
+    if (!isFileType) {
+      throw new AppError('Item does not support file uploads', 400, 'INVALID_ITEM_TYPE');
+    }
+
+    // For single file type, remove existing file
+    if (item.templateItem.type === 'file' && item.files.length > 0) {
+      await prisma.checklistItemFile.deleteMany({
+        where: { itemId }
+      });
+    }
+
+    // Create new file record
+    const file = await prisma.checklistItemFile.create({
+      data: {
+        itemId,
+        filePath,
+        originalName,
+        fileSize,
+        mimeType,
+        version: 1,
+        uploadedBy
+      }
+    });
+
+    // Update checklist completeness
+    await this.updateChecklistCompleteness(item.checklistId);
+
+    logger.info(`File uploaded for checklist item ${itemId}: ${originalName}`);
+    
+    return file;
+  }
+
+  /**
+   * Manually assign additional checklist template to project
+   * For project-specific checklists beyond service associations
+   */
+async assignTemplateToProject(
+  projectId: string,
+  templateFileId: string,
+  assignedBy: string,
+  reason?: string
+) {
+  // 1️⃣ Validate project (OUTSIDE transaction)
+  const project = await prisma.project.findUnique({
+    where: { id: projectId }
+  });
+
+  if (!project) {
+    throw new AppError('Project not found', 404, 'PROJECT_NOT_FOUND');
+  }
+
+  // 2️⃣ Validate template (OUTSIDE transaction)
+  const template = await prisma.checklistTemplateFile.findUnique({
+    where: { id: templateFileId }
+  });
+
+  if (!template) {
+    throw new AppError('Checklist template not found', 404, 'TEMPLATE_NOT_FOUND');
+  }
+
+  // 3️⃣ Transaction only for atomic DB write
+  return prisma.$transaction(async (tx) => {
+    // Prevent duplicate assignment
+    const existing = await tx.projectTemplateAssignment.findUnique({
+      where: {
+        projectId_templateFileId: {
+          projectId,
+          templateFileId
+        }
+      }
+    });
+
+    if (existing) {
+      throw new AppError(
+        'Template already assigned to this project',
+        400,
+        'TEMPLATE_ALREADY_ASSIGNED'
+      );
+    }
+
+    // Create assignment
+    return tx.projectTemplateAssignment.create({
+      data: {
+        projectId,
+        templateFileId,
+        status: 'assigned',
+        assignedBy,
+        currentRemarks: reason ?? null
+      },
+      include: {
+        templateFile: {
+          include: {
+            attachments: {
+              orderBy: { sortOrder: 'asc' }
+            }
+          }
+        }
+      }
+    });
+  });
+}
+
+
+
+
+  /**
+   * Get available checklist templates for manual assignment to a project
+   * Returns templates not already assigned to the project
+   */
+async getAvailableTemplatesForProject(projectId: string, category?: string) {
+  // Verify project exists
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true, name: true, projectNumber: true }
+  });
+
+  if (!project) {
+    throw new AppError('Project not found', 404, 'PROJECT_NOT_FOUND');
+  }
+
+  // Get template file IDs already assigned to this project
+  const assignedTemplates = await prisma.projectTemplateAssignment.findMany({
+    where: { projectId },
+    select: { templateFileId: true }
+  });
+
+  const assignedTemplateIds = assignedTemplates.map(a => a.templateFileId);
+
+  // Build where clause
+  const where: any = {
+    id: {
+      notIn: assignedTemplateIds.length > 0 ? assignedTemplateIds : []
+    }
+  };
+
+  // Add category filter if provided
+  if (category) {
+    where.category = category;
+  }
+
+  // Get all template files not already assigned
+  const availableTemplates = await prisma.checklistTemplateFile.findMany({
+    where,
+    include: {
+      attachments: {
+        orderBy: { sortOrder: 'asc' },
+        select: {
+          id: true,
+          originalName: true,
+          fileSize: true,
+          mimeType: true
+        }
+      },
+      _count: {
+        select: { attachments: true }
+      }
+    },
+    orderBy: [
+      { category: 'asc' },
+      { title: 'asc' }
+    ]
+  });
+
+return availableTemplates.map(template => ({
+  id: template.id,
+  title: template.title,
+  description: template.description,
+  category: template.category,
+  clientVisible: template.clientVisible,
+  attachmentCount: template._count.attachments,  // ✅ _count is used HERE
+  attachments: template.attachments.map(a => ({
+    id: a.id,
+    originalName: a.originalName,
+    fileSize: a.fileSize?.toString(),
+    mimeType: a.mimeType
+  }))
+}));
+}
+
+async getTemplateFiles(filters?: {
+  category?: string;
+  clientVisible?: boolean;
+  search?: string;
+}) {
+  const where: any = {};
+
+  if (filters?.category) {
+    where.category = filters.category;
+  }
+
+  if (filters?.clientVisible !== undefined) {
+    where.clientVisible = filters.clientVisible;
+  }
+
+  if (filters?.search) {
+    where.OR = [
+      { title: { contains: filters.search, mode: 'insensitive' } },
+      { description: { contains: filters.search, mode: 'insensitive' } }
+    ];
+  }
+
+  const templateFiles = await prisma.checklistTemplateFile.findMany({
+    where,
+    include: {
+      attachments: {
+        orderBy: { sortOrder: 'asc' },
+        select: {
+          id: true,
+          filePath: true,
+          originalName: true,
+          fileSize: true,
+          mimeType: true,
+          sortOrder: true,
+          uploadedBy: true,
+          uploadedAt: true
+        }
+      },
+      _count: {
+        select: { attachments: true }
+      }
+    },
+    orderBy: [
+      { category: 'asc' },
+      { title: 'asc' }
+    ]
+  });
+
+  return templateFiles.map(template => this.serializeTemplateFile(template));
+}
+
+async getTemplateFileById(id: string) {
+  const templateFile = await prisma.checklistTemplateFile.findUnique({
+    where: { id },
+    include: {
+      attachments: {
+        orderBy: { sortOrder: 'asc' },
+        select: {
+          id: true,
+          filePath: true,
+          originalName: true,
+          fileSize: true,
+          mimeType: true,
+          sortOrder: true,
+          uploadedBy: true,
+          uploadedAt: true
+        }
+      },
+      _count: {
+        select: { attachments: true }
+      }
+    }
+  });
+
+  if (!templateFile) {
+    throw new AppError('Template file not found', 404, 'TEMPLATE_FILE_NOT_FOUND');
+  }
+
+  return this.serializeTemplateFile(templateFile);
+}
+
+private serializeTemplateFile(template: any) {
+  return {
+    id: template.id,
+    title: template.title,
+    description: template.description,
+    category: template.category,
+    clientVisible: template.clientVisible,
+    createdBy: template.createdBy,
+    createdAt: template.createdAt,
+    updatedAt: template.updatedAt,
+    attachmentCount: template._count?.attachments || template.attachments?.length || 0,
+    attachments: (template.attachments || []).map((att: any) => ({
+      id: att.id,
+      filePath: att.filePath,
+      originalName: att.originalName,
+      fileSize: att.fileSize?.toString(), // Convert BigInt to string for JSON
+      mimeType: att.mimeType,
+      sortOrder: att.sortOrder,
+      uploadedBy: att.uploadedBy,
+      uploadedAt: att.uploadedAt,
+      // Add download URL for frontend convenience
+      downloadUrl: `/api/v1/template-files/${template.id}/attachments/${att.id}/download`
+    }))
+  };
+}
+  /**
+   * FILE STATUS WORKFLOW METHODS
+   * Implements the complete file review and verification workflow
+   */
+
+  /**
+   * Submit file for admin review - Client action
+   * Status transition: uploaded/responded → submitted/resubmitted
+   */
+  async submitFileForReview(fileId: string, userId: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const file = await tx.checklistItemFile.findFirst({
+        where: {
+          id: fileId,
+          status: { in: ['uploaded', 'responded'] }
+        },
+        include: {
+          item: {
+            include: {
+              checklist: true
+            }
+          }
+        }
+      });
+
+      if (!file) {
+        throw new AppError('File not found or invalid status', 404, 'FILE_NOT_FOUND');
+      }
+
+      if (file.isLocked) {
+        throw new AppError('File is locked and cannot be modified', 400, 'FILE_LOCKED');
+      }
+
+      const newStatus = file.status === 'uploaded' ? 'submitted' : 'resubmitted';
+
+      const updatedFile = await tx.checklistItemFile.update({
+        where: { id: fileId },
+        data: {
+          status: newStatus,
+          submittedBy: userId,
+          submittedAt: new Date()
+        }
+      });
+
+      // Update checklist status
+      await this.checkAndUpdateChecklistStatus(file.item.checklistId, tx);
+
+      logger.info('File submitted for review', { fileId, status: newStatus, userId });
+
+      return this.serializeChecklistFile(updatedFile);
+    });
+  }
+
+  /**
+   * Mark file as under review - Admin action
+   * Status transition: submitted/resubmitted → under_review
+   */
+  async markFileUnderReview(fileId: string, userId: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const file = await tx.checklistItemFile.findFirst({
+        where: {
+          id: fileId,
+          status: { in: ['submitted', 'resubmitted'] }
+        }
+      });
+
+      if (!file) {
+        throw new AppError('File not found or invalid status', 404, 'FILE_NOT_FOUND');
+      }
+
+      const updatedFile = await tx.checklistItemFile.update({
+        where: { id: fileId },
+        data: {
+          status: 'under_review',
+          reviewedBy: userId,
+          reviewedAt: new Date()
+        }
+      });
+
+      logger.info('File marked under review', { fileId, userId });
+
+      return this.serializeChecklistFile(updatedFile);
+    });
+  }
+
+  /**
+   * Send file back with remarks - Admin action
+   * Status transition: under_review → responded
+   */
+  async sendFileBackWithRemarks(fileId: string, userId: string, remarks: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const file = await tx.checklistItemFile.findFirst({
+        where: {
+          id: fileId,
+          status: 'under_review'
+        },
+        include: {
+          item: {
+            include: {
+              checklist: true
+            }
+          }
+        }
+      });
+
+      if (!file) {
+        throw new AppError('File not found or not under review', 404, 'FILE_NOT_FOUND');
+      }
+
+      const updatedFile = await tx.checklistItemFile.update({
+        where: { id: fileId },
+        data: {
+          status: 'responded',
+          reviewedBy: userId,
+          reviewedAt: new Date(),
+          reviewRemarks: remarks
+        }
+      });
+
+      // Update checklist status
+      await this.checkAndUpdateChecklistStatus(file.item.checklistId, tx);
+
+      logger.info('File sent back with remarks', { fileId, userId });
+
+      return this.serializeChecklistFile(updatedFile);
+    });
+  }
+
+  /**
+   * Verify file as complete - Admin action
+   * Status transition: under_review → verified
+   */
+  async verifyFile(fileId: string, userId: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const file = await tx.checklistItemFile.findFirst({
+        where: {
+          id: fileId,
+          status: 'under_review'
+        },
+        include: {
+          item: {
+            include: {
+              checklist: true
+            }
+          }
+        }
+      });
+
+      if (!file) {
+        throw new AppError('File not found or not under review', 404, 'FILE_NOT_FOUND');
+      }
+
+      const updatedFile = await tx.checklistItemFile.update({
+        where: { id: fileId },
+        data: {
+          status: 'verified',
+          verifiedBy: userId,
+          verifiedAt: new Date()
+        }
+      });
+
+      // Update checklist status if all files verified
+      await this.checkAndUpdateChecklistStatus(file.item.checklistId, tx);
+
+      logger.info('File verified', { fileId, userId });
+
+      return this.serializeChecklistFile(updatedFile);
+    });
+  }
+
+  /**
+   * Close checklist and lock all files - Admin action
+   * All files → locked (isLocked = true)
+   */
+  async closeChecklistAndLockFiles(checklistId: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const checklist = await tx.projectChecklist.findUnique({
+        where: { id: checklistId },
+        include: {
+          items: {
+            include: {
+              files: true
+            }
+          }
+        }
+      });
+
+      if (!checklist) {
+        throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+      }
+
+      // Lock all files
+      const fileIds = checklist.items.flatMap(item => item.files.map(f => f.id));
+
+      await tx.checklistItemFile.updateMany({
+        where: {
+          id: { in: fileIds }
+        },
+        data: {
+          isLocked: true,
+          lockedAt: new Date()
+        }
+      });
+
+      // Update checklist status
+      const updatedChecklist = await tx.projectChecklist.update({
+        where: { id: checklistId },
+        data: {
+          status: 'verified_closed'
+        }
+      });
+
+      logger.info('Checklist closed and files locked', { checklistId, fileCount: fileIds.length });
+
+      return { checklist: updatedChecklist };
+    });
+  }
+
+  /**
+   * Get file version history
+   */
+  async getFileVersionHistory(fileId: string): Promise<any> {
+    // Get the item ID from the file
+    const file = await prisma.checklistItemFile.findUnique({
+      where: { id: fileId },
+      select: { itemId: true, originalName: true }
+    });
+
+    if (!file) {
+      throw new AppError('File not found', 404, 'FILE_NOT_FOUND');
+    }
+
+    // Get all versions of files for this item with the same name
+    const versions = await prisma.checklistItemFile.findMany({
+      where: {
+        itemId: file.itemId,
+        originalName: file.originalName
+      },
+      orderBy: {
+        version: 'desc'
+      },
+      include: {
+        submitter: {
+          select: { id: true, firstName: true, lastName: true }
+        },
+        reviewer: {
+          select: { id: true, firstName: true, lastName: true }
+        },
+        verifier: {
+          select: { id: true, firstName: true, lastName: true }
+        }
+      }
+    });
+
+    return {
+      versions: versions.map(v => this.serializeChecklistFile(v))
+    };
+  }
+
+  /**
+   * Submit all files in checklist for review - Client bulk action
+   */
+  async submitChecklistForReview(checklistId: string, userId: string): Promise<any> {
+    return await prisma.$transaction(async (tx) => {
+      const checklist = await tx.projectChecklist.findUnique({
+        where: { id: checklistId },
+        include: {
+          items: {
+            include: {
+              files: true
+            }
+          }
+        }
+      });
+
+      if (!checklist) {
+        throw new AppError('Checklist not found', 404, 'CHECKLIST_NOT_FOUND');
+      }
+
+      // Find all files that can be submitted (uploaded or responded)
+      const submittableFiles = checklist.items.flatMap(item =>
+        item.files.filter(f => ['uploaded', 'responded'].includes(f.status) && !f.isLocked)
+      );
+
+      if (submittableFiles.length === 0) {
+        throw new AppError('No files available for submission', 400, 'NO_FILES_TO_SUBMIT');
+      }
+
+      // Update all submittable files
+      const fileIds = submittableFiles.map(f => f.id);
+
+      await tx.checklistItemFile.updateMany({
+        where: {
+          id: { in: fileIds }
+        },
+        data: {
+          status: 'submitted',
+          submittedBy: userId,
+          submittedAt: new Date()
+        }
+      });
+
+      // Update checklist status
+      await this.checkAndUpdateChecklistStatus(checklistId, tx);
+
+      logger.info('Checklist submitted for review', { checklistId, fileCount: fileIds.length, userId });
+
+      return {
+        message: `${fileIds.length} files submitted for review`,
+        filesSubmitted: fileIds.length
+      };
+    });
+  }
+
+  /**
+   * Helper: Check and update checklist status based on file statuses
+   */
+  private async checkAndUpdateChecklistStatus(
+    checklistId: string,
+    tx: any
+  ): Promise<void> {
+    const checklist = await tx.projectChecklist.findUnique({
+      where: { id: checklistId },
+      include: {
+        items: {
+          include: {
+            files: true
+          }
+        }
+      }
+    });
+
+    if (!checklist) return;
+
+    const allFiles = checklist.items.flatMap(item => item.files);
+
+    if (allFiles.length === 0) return;
+
+    const statuses = {
+      uploaded: allFiles.filter(f => f.status === 'uploaded').length,
+      submitted: allFiles.filter(f => f.status === 'submitted').length,
+      resubmitted: allFiles.filter(f => f.status === 'resubmitted').length,
+      under_review: allFiles.filter(f => f.status === 'under_review').length,
+      responded: allFiles.filter(f => f.status === 'responded').length,
+      verified: allFiles.filter(f => f.status === 'verified').length
+    };
+
+    let newStatus = checklist.status;
+
+    // All files verified
+    if (statuses.verified === allFiles.length) {
+      newStatus = 'verified_closed';
+    }
+    // Any file sent back
+    else if (statuses.responded > 0) {
+      newStatus = 'incomplete_admin_remarked';
+    }
+    // All files submitted or in review
+    else if (statuses.submitted + statuses.resubmitted + statuses.under_review === allFiles.length) {
+      if (statuses.resubmitted > 0) {
+        newStatus = 'resubmitted_by_client';
+      } else {
+        newStatus = 'submitted_by_client';
+      }
+    }
+
+    if (newStatus !== checklist.status) {
+      await tx.projectChecklist.update({
+        where: { id: checklistId },
+        data: { status: newStatus }
+      });
+    }
+  }
+
+  /**
+   * Helper: Serialize checklist file (convert BigInt to string)
+   */
+  private serializeChecklistFile(file: any): any {
+    return {
+      ...file,
+      fileSize: file.fileSize ? file.fileSize.toString() : null,
+      uploadedAt: file.uploadedAt?.toISOString(),
+      submittedAt: file.submittedAt?.toISOString(),
+      reviewedAt: file.reviewedAt?.toISOString(),
+      verifiedAt: file.verifiedAt?.toISOString(),
+      lockedAt: file.lockedAt?.toISOString()
+    };
+  }
+}

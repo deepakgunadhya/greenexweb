@@ -1,0 +1,6 @@
+{
+  "name": "@greenex/tailwind-config",
+  "version": "0.1.0",
+  "description": "Shared Tailwind config for Greenex",
+  "main": "index.js"
+}

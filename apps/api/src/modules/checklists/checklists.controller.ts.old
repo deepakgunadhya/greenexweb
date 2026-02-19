@@ -1,0 +1,525 @@
+import { Request, Response } from "express";
+import { successResponse, errorResponse } from "../../utils/response";
+import { asyncHandler, AppError } from "../../middleware/error.middleware";
+import { ChecklistTemplateService, CreateTemplateDto, UpdateTemplateDto, CreateTemplateItemDto, UpdateTemplateItemDto, ItemOrder } from "./checklist-template.service";
+import { logger } from "../../utils/logger";
+import { AuthenticatedRequest } from "../../middleware/auth.middleware";
+import prisma from "../../config/database";
+
+export class ChecklistsController {
+  private checklistService = new ChecklistTemplateService();
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates:
+   *   get:
+   *     summary: Get all checklist templates
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: query
+   *         name: category
+   *         schema:
+   *           type: string
+   *         description: Filter by category
+   *       - in: query
+   *         name: isActive
+   *         schema:
+   *           type: boolean
+   *         description: Filter by active status
+   *       - in: query
+   *         name: serviceId
+   *         schema:
+   *           type: string
+   *         description: Filter by associated service ID
+   *     responses:
+   *       200:
+   *         description: Checklist templates retrieved successfully
+   */
+  getTemplates = asyncHandler(async (req: Request, res: Response) => {
+    const { category, isActive, serviceId } = req.query;
+    
+    const filters: any = {};
+    if (category) filters.category = category as string;
+    if (isActive !== undefined) filters.isActive = isActive === 'true';
+    if (serviceId) filters.serviceId = serviceId as string;
+
+    const templates = await this.checklistService.getTemplates(filters);
+    res.json(successResponse(templates));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}:
+   *   get:
+   *     summary: Get checklist template by ID
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Checklist template retrieved successfully
+   *       404:
+   *         description: Template not found
+   */
+  getTemplate = asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    
+    const template = await this.checklistService.getTemplate(id);
+    if (!template) {
+      throw new AppError('Checklist template not found', 404, 'TEMPLATE_NOT_FOUND');
+    }
+    
+    res.json(successResponse(template));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates:
+   *   post:
+   *     summary: Create a new checklist template
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - name
+   *               - category
+   *               - items
+   *             properties:
+   *               name:
+   *                 type: string
+   *               category:
+   *                 type: string
+   *                 enum: [environment, labour, ethics, procurement, other]
+   *               description:
+   *                 type: string
+   *               expectedTatDays:
+   *                 type: integer
+   *               items:
+   *                 type: array
+   *                 items:
+   *                   type: object
+   *                   properties:
+   *                     itemCode:
+   *                       type: string
+   *                     label:
+   *                       type: string
+   *                     type:
+   *                       type: string
+   *                       enum: [text, textarea, number, dropdown, date, file, multi_file, reference]
+   *                     helpText:
+   *                       type: string
+   *                     isMandatory:
+   *                       type: boolean
+   *                     visibleToClient:
+   *                       type: boolean
+   *                     expectedDocumentType:
+   *                       type: string
+   *                     sectionGroup:
+   *                       type: string
+   *                     sortOrder:
+   *                       type: integer
+   *                     dropdownOptions:
+   *                       type: object
+   *               serviceIds:
+   *                 type: array
+   *                 items:
+   *                   type: string
+   *     responses:
+   *       201:
+   *         description: Checklist template created successfully
+   *       400:
+   *         description: Validation error
+   */
+  createTemplate = asyncHandler(async (req: Request, res: Response) => {
+    const templateData: CreateTemplateDto = req.body;
+    
+    const template = await this.checklistService.createTemplate(templateData);
+    res.status(201).json(successResponse(template));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}:
+   *   put:
+   *     summary: Update a checklist template
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               name:
+   *                 type: string
+   *               category:
+   *                 type: string
+   *                 enum: [environment, labour, ethics, procurement, other]
+   *               description:
+   *                 type: string
+   *               expectedTatDays:
+   *                 type: integer
+   *               isActive:
+   *                 type: boolean
+   *     responses:
+   *       200:
+   *         description: Checklist template updated successfully
+   *       404:
+   *         description: Template not found
+   */
+  updateTemplate = asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const updates: UpdateTemplateDto = req.body;
+    
+    const template = await this.checklistService.updateTemplate(id, updates);
+    res.json(successResponse(template));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}:
+   *   delete:
+   *     summary: Delete (deactivate) a checklist template
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Template deactivated successfully
+   *       404:
+   *         description: Template not found
+   *       400:
+   *         description: Template is in use and cannot be deleted
+   */
+  deleteTemplate = asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    
+    await this.checklistService.deleteTemplate(id);
+    res.json(successResponse({ message: 'Checklist template deactivated successfully' }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}/items:
+   *   post:
+   *     summary: Add an item to a checklist template
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - itemCode
+   *               - label
+   *               - type
+   *             properties:
+   *               itemCode:
+   *                 type: string
+   *               label:
+   *                 type: string
+   *               type:
+   *                 type: string
+   *                 enum: [text, textarea, number, dropdown, date, file, multi_file, reference]
+   *               helpText:
+   *                 type: string
+   *               isMandatory:
+   *                 type: boolean
+   *               visibleToClient:
+   *                 type: boolean
+   *               expectedDocumentType:
+   *                 type: string
+   *               sectionGroup:
+   *                 type: string
+   *               sortOrder:
+   *                 type: integer
+   *               dropdownOptions:
+   *                 type: object
+   *     responses:
+   *       201:
+   *         description: Item added successfully
+   *       400:
+   *         description: Validation error
+   */
+  addTemplateItem = asyncHandler(async (req: Request, res: Response) => {
+    const { id: templateId } = req.params;
+    const itemData: CreateTemplateItemDto = req.body;
+    
+    const item = await this.checklistService.addTemplateItem(templateId, itemData);
+    res.status(201).json(successResponse(item));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{templateId}/items/{itemId}:
+   *   put:
+   *     summary: Update a template item
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: templateId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: itemId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             properties:
+   *               label:
+   *                 type: string
+   *               type:
+   *                 type: string
+   *               helpText:
+   *                 type: string
+   *               isMandatory:
+   *                 type: boolean
+   *               visibleToClient:
+   *                 type: boolean
+   *               expectedDocumentType:
+   *                 type: string
+   *               sectionGroup:
+   *                 type: string
+   *               sortOrder:
+   *                 type: integer
+   *               dropdownOptions:
+   *                 type: object
+   *     responses:
+   *       200:
+   *         description: Item updated successfully
+   *       404:
+   *         description: Item not found
+   */
+  updateTemplateItem = asyncHandler(async (req: Request, res: Response) => {
+    const { templateId, itemId } = req.params;
+    const updates: UpdateTemplateItemDto = req.body;
+    
+    const item = await this.checklistService.updateTemplateItem(templateId, itemId, updates);
+    res.json(successResponse(item));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{templateId}/items/{itemId}:
+   *   delete:
+   *     summary: Delete a template item
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: templateId
+   *         required: true
+   *         schema:
+   *           type: string
+   *       - in: path
+   *         name: itemId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Item deleted successfully
+   *       400:
+   *         description: Item is in use and cannot be deleted
+   */
+  deleteTemplateItem = asyncHandler(async (req: Request, res: Response) => {
+    const { templateId, itemId } = req.params;
+    
+    await this.checklistService.deleteTemplateItem(templateId, itemId);
+    res.json(successResponse({ message: 'Template item deleted successfully' }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}/items/reorder:
+   *   put:
+   *     summary: Reorder template items
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - itemOrders
+   *             properties:
+   *               itemOrders:
+   *                 type: array
+   *                 items:
+   *                   type: object
+   *                   properties:
+   *                     itemId:
+   *                       type: string
+   *                     sortOrder:
+   *                       type: integer
+   *     responses:
+   *       200:
+   *         description: Items reordered successfully
+   */
+  reorderTemplateItems = asyncHandler(async (req: Request, res: Response) => {
+    const { id: templateId } = req.params;
+    const { itemOrders }: { itemOrders: ItemOrder[] } = req.body;
+    
+    await this.checklistService.reorderTemplateItems(templateId, itemOrders);
+    res.json(successResponse({ message: 'Template items reordered successfully' }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}/services:
+   *   put:
+   *     summary: Associate template with services
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - serviceIds
+   *             properties:
+   *               serviceIds:
+   *                 type: array
+   *                 items:
+   *                   type: string
+   *     responses:
+   *       200:
+   *         description: Services associated successfully
+   */
+  associateWithServices = asyncHandler(async (req: Request, res: Response) => {
+    const { id: templateId } = req.params;
+    const { serviceIds }: { serviceIds: string[] } = req.body;
+    
+    await this.checklistService.associateWithServices(templateId, serviceIds);
+    res.json(successResponse({ message: 'Template associated with services successfully' }));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/{id}/clone:
+   *   post:
+   *     summary: Clone a checklist template
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: id
+   *         required: true
+   *         schema:
+   *           type: string
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - newName
+   *             properties:
+   *               newName:
+   *                 type: string
+   *     responses:
+   *       201:
+   *         description: Template cloned successfully
+   *       404:
+   *         description: Source template not found
+   */
+  cloneTemplate = asyncHandler(async (req: Request, res: Response) => {
+    const { id: sourceTemplateId } = req.params;
+    const { newName }: { newName: string } = req.body;
+    
+    const clonedTemplate = await this.checklistService.cloneTemplate(sourceTemplateId, newName);
+    res.status(201).json(successResponse(clonedTemplate));
+  });
+
+  /**
+   * @swagger
+   * /api/v1/checklists/templates/by-service/{serviceId}:
+   *   get:
+   *     summary: Get templates associated with a service
+   *     tags: [Checklists]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: serviceId
+   *         required: true
+   *         schema:
+   *           type: string
+   *     responses:
+   *       200:
+   *         description: Templates retrieved successfully
+   */
+  getTemplatesByService = asyncHandler(async (req: Request, res: Response) => {
+    const { serviceId } = req.params;
+    
+    const templates = await this.checklistService.getTemplatesByService(serviceId);
+    res.json(successResponse(templates));
+  });
+}

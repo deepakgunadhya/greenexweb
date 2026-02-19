@@ -1,0 +1,905 @@
+// services/fcm/fcm.service.ts
+
+import admin from "firebase-admin";
+import prisma from "../../config/database";
+import { AppError } from "../../middleware/error.middleware";
+import { logger } from "../../utils/logger";
+import { Platform, NotificationType, DeviceToken } from "@prisma/client";
+import * as path from "path";
+import * as fs from "fs";
+
+// ==================== INTERFACES ====================
+
+export interface RegisterTokenRequest {
+  token: string;
+  platform: Platform;
+  type?: NotificationType;
+  deviceId?: string;
+  deviceInfo?: {
+    model?: string;
+    osVersion?: string;
+    appVersion?: string;
+  };
+  userId?: string;
+}
+
+export interface SendNotificationRequest {
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+  imageUrl?: string;
+  userId?: string;
+  tokens?: string[];
+  topic?: string;
+
+  android?: {
+    priority?: "normal" | "high";
+    ttl?: number;
+    notification?: {
+      channelId?: string;
+      clickAction?: string;
+      imageUrl?: string;
+    };
+  };
+
+  apns?: {
+    headers?: {
+      "apns-priority"?: "10" | "5";
+      "apns-expiration"?: string;
+    };
+    payload?: {
+      aps?: {
+        alert?: {
+          title?: string;
+          body?: string;
+        };
+        badge?: number;
+        sound?: string;
+        "content-available"?: 1;
+        [key: string]: any;
+      };
+      [key: string]: any;
+    };
+  };
+}
+
+
+export interface NotificationResult {
+  success: boolean;
+  successCount: number;
+  failureCount: number;
+  results?: admin.messaging.BatchResponse;
+  failedTokens?: string[];
+  error?: string;
+}
+
+export interface TokenStats {
+  total: number;
+  active: number;
+  inactive: number;
+  byPlatform: Record<Platform, number>;
+  byType: Record<NotificationType, number>;
+}
+
+// ==================== SERVICE ====================
+
+export class FCMService {
+  private isFirebaseInitialized: boolean = false;
+
+  constructor() {
+    this.initializeFirebase();
+  }
+
+  private initializeFirebase(): void {
+    if (admin.apps.length) {
+      this.isFirebaseInitialized = true;
+      return;
+    }
+
+    try {
+      const configDir = path.resolve(__dirname, "../../config");
+      let serviceAccount: admin.ServiceAccount | null = null;
+
+      if (fs.existsSync(configDir)) {
+        const files = fs.readdirSync(configDir);
+
+        const firebaseJson = files.find(
+          (file) =>
+            file.toLowerCase().includes("firebase") && file.endsWith(".json")
+        );
+
+        if (firebaseJson) {
+          const fullPath = path.join(configDir, firebaseJson);
+          serviceAccount = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+          logger.info("Using Firebase service account from directory", {
+            path: fullPath,
+          });
+        }
+      }
+
+      if (!serviceAccount) {
+        logger.warn(
+          "Firebase service account not found in config directory. FCM features disabled."
+        );
+        this.isFirebaseInitialized = false;
+        return;
+      }
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+
+      this.isFirebaseInitialized = true;
+      logger.info("Firebase Admin initialized successfully");
+    } catch (error) {
+      logger.error("Failed to initialize Firebase Admin", error);
+      this.isFirebaseInitialized = false;
+    }
+  }
+
+  private ensureFirebaseInitialized(): void {
+    if (!this.isFirebaseInitialized) {
+      throw new AppError(
+        "Firebase is not configured. Please set up Firebase credentials.",
+        503,
+        "FIREBASE_NOT_CONFIGURED"
+      );
+    }
+  }
+
+  // ==================== TOKEN MANAGEMENT ====================
+
+async registerToken(data: RegisterTokenRequest): Promise<DeviceToken> {
+  try {
+    let deviceToken: DeviceToken;
+
+    // If deviceId is provided, check if device already exists
+    if (data.deviceId) {
+      const existingDevice = await prisma.deviceToken.findFirst({
+        where: {
+          deviceId: data.deviceId,
+        },
+      });
+
+      if (existingDevice) {
+        // Device exists - update with new FCM token
+        deviceToken = await prisma.deviceToken.update({
+          where: {
+            id: existingDevice.id,
+          },
+          data: {
+            token: data.token,
+            userId: data.userId ?? existingDevice.userId,
+            type: data.type ?? existingDevice.type,
+            platform: data.platform,
+            deviceInfo: data.deviceInfo ?? existingDevice.deviceInfo,
+            isActive: true,
+            lastUsedAt: new Date(),
+          },
+        });
+
+        logger.info("Device token updated for existing device", {
+          tokenId: deviceToken.id,
+          deviceId: deviceToken.deviceId,
+          oldToken: existingDevice.token,
+          newToken: deviceToken.token,
+        });
+
+        return deviceToken;
+      }
+    }
+
+    // No deviceId or device not found - upsert by token
+    deviceToken = await prisma.deviceToken.upsert({
+      where: {
+        token: data.token,
+      },
+      update: {
+        userId: data.userId ?? null,
+        type: data.type ?? NotificationType.broadcast,
+        platform: data.platform,
+        deviceId: data.deviceId ?? null,
+        deviceInfo: data.deviceInfo ?? undefined,
+        isActive: true,
+        lastUsedAt: new Date(),
+      },
+      create: {
+        token: data.token,
+        userId: data.userId ?? null,
+        type: data.type ?? NotificationType.broadcast,
+        platform: data.platform,
+        deviceId: data.deviceId ?? null,
+        deviceInfo: data.deviceInfo ?? null,
+        isActive: true,
+        lastUsedAt: new Date(),
+      },
+    });
+
+    logger.info("Device token registered successfully", {
+      tokenId: deviceToken.id,
+      userId: deviceToken.userId,
+      platform: deviceToken.platform,
+      type: deviceToken.type,
+      deviceId: deviceToken.deviceId,
+    });
+
+    return deviceToken;
+  } catch (error) {
+    logger.error("Failed to register device token", error);
+    throw new AppError(
+      "Failed to register device token",
+      500,
+      "TOKEN_REGISTRATION_FAILED"
+    );
+  }
+}
+
+  async getActiveTokens(userId?: string): Promise<string[]> {
+    try {
+      const whereClause: {
+        isActive: boolean;
+        userId?: string;
+      } = { isActive: true };
+
+      if (userId) {
+        whereClause.userId = userId;
+      }
+
+      const tokens = await prisma.deviceToken.findMany({
+        where: whereClause,
+        select: { token: true },
+      });
+
+      return tokens.map((t) => t.token);
+    } catch (error) {
+      logger.error("Failed to get active tokens", error);
+      return [];
+    }
+  }
+
+  async getTokensByType(type: NotificationType): Promise<string[]> {
+    try {
+      const tokens = await prisma.deviceToken.findMany({
+        where: {
+          isActive: true,
+          type: type,
+        },
+        select: { token: true },
+      });
+
+      return tokens.map((t) => t.token);
+    } catch (error) {
+      logger.error("Failed to get tokens by type", error);
+      return [];
+    }
+  }
+
+  async getTokensByPlatform(platform: Platform): Promise<string[]> {
+    try {
+      const tokens = await prisma.deviceToken.findMany({
+        where: {
+          isActive: true,
+          platform: platform,
+        },
+        select: { token: true },
+      });
+
+      return tokens.map((t) => t.token);
+    } catch (error) {
+      logger.error("Failed to get tokens by platform", error);
+      return [];
+    }
+  }
+
+  async deleteToken(token: string): Promise<void> {
+    try {
+      await prisma.deviceToken.delete({
+        where: { token },
+      });
+
+      logger.info("Device token deleted successfully", { token });
+    } catch (error) {
+      logger.error("Failed to delete device token", error);
+      throw new AppError(
+        "Failed to delete device token",
+        500,
+        "TOKEN_DELETION_FAILED"
+      );
+    }
+  }
+
+  async deleteUserTokens(userId: string): Promise<number> {
+    try {
+      const result = await prisma.deviceToken.deleteMany({
+        where: { userId },
+      });
+
+      logger.info("User device tokens deleted successfully", {
+        userId,
+        count: result.count,
+      });
+
+      return result.count;
+    } catch (error) {
+      logger.error("Failed to delete user device tokens", error);
+      throw new AppError(
+        "Failed to delete user device tokens",
+        500,
+        "USER_TOKENS_DELETION_FAILED"
+      );
+    }
+  }
+
+  async updateTokenType(
+    token: string,
+    type: NotificationType
+  ): Promise<DeviceToken> {
+    try {
+      const updatedToken = await prisma.deviceToken.update({
+        where: { token },
+        data: { type },
+      });
+
+      logger.info("Token type updated", { token, type });
+      return updatedToken;
+    } catch (error) {
+      logger.error("Failed to update token type", error);
+      throw new AppError(
+        "Failed to update token type",
+        500,
+        "TOKEN_UPDATE_FAILED"
+      );
+    }
+  }
+
+  // ==================== PUSH NOTIFICATION METHODS ====================
+
+  async sendToUser(
+    userId: string,
+    notification: Omit<SendNotificationRequest, "userId">
+  ): Promise<NotificationResult> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const tokens = await this.getActiveTokens(userId);
+
+      if (tokens.length === 0) {
+        logger.warn("No active tokens found for user", { userId });
+        return {
+          success: false,
+          successCount: 0,
+          failureCount: 0,
+          error: "No active tokens found for user",
+        };
+      }
+
+      return await this.sendToTokens(tokens, notification);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Failed to send notification to user", { userId, error });
+      return {
+        success: false,
+        successCount: 0,
+        failureCount: 0,
+        error: errorMessage,
+      };
+    }
+  }
+
+  async sendToTokens(
+    tokens: string[],
+    notification: Omit<SendNotificationRequest, "tokens">
+  ): Promise<NotificationResult> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      if (tokens.length === 0) {
+        return {
+          success: false,
+          successCount: 0,
+          failureCount: 0,
+          error: "No tokens provided",
+        };
+      }
+
+      const message: admin.messaging.MulticastMessage = {
+        notification: {
+          title: notification.title,
+          body: notification.body,
+          ...(notification.imageUrl && { imageUrl: notification.imageUrl }),
+        },
+        ...(notification.data && { data: notification.data }),
+        tokens,
+      };
+
+      const response = await admin.messaging().sendEachForMulticast(message);
+
+      const failedTokens: string[] = [];
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          const error = resp.error;
+          if (
+            error?.code === "messaging/invalid-registration-token" ||
+            error?.code === "messaging/registration-token-not-registered"
+          ) {
+            failedTokens.push(tokens[idx]);
+          }
+        }
+      });
+
+      if (failedTokens.length > 0) {
+        await this.markTokensInactive(failedTokens);
+      }
+
+      logger.info("Batch notification sent", {
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+        totalTokens: tokens.length,
+      });
+
+      return {
+        success: response.successCount > 0,
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+        results: response,
+        failedTokens,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Failed to send batch notification", error);
+      return {
+        success: false,
+        successCount: 0,
+        failureCount: tokens.length,
+        error: errorMessage,
+      };
+    }
+  }
+
+  async sendToAllDevices(
+    notification: Omit<SendNotificationRequest, "userId" | "tokens">
+  ): Promise<NotificationResult> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const tokens = await this.getActiveTokens();
+
+      if (tokens.length === 0) {
+        logger.warn("No active tokens found for broadcast");
+        return {
+          success: false,
+          successCount: 0,
+          failureCount: 0,
+          error: "No active tokens found",
+        };
+      }
+
+      const batchSize = 500;
+      let totalSuccess = 0;
+      let totalFailure = 0;
+      const allFailedTokens: string[] = [];
+
+      for (let i = 0; i < tokens.length; i += batchSize) {
+        const batch = tokens.slice(i, i + batchSize);
+        const result = await this.sendToTokens(batch, notification);
+
+        totalSuccess += result.successCount;
+        totalFailure += result.failureCount;
+
+        if (result.failedTokens) {
+          allFailedTokens.push(...result.failedTokens);
+        }
+
+        // Rate limiting delay between batches
+        if (i + batchSize < tokens.length) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+
+      logger.info("Broadcast notification completed", {
+        totalTokens: tokens.length,
+        successCount: totalSuccess,
+        failureCount: totalFailure,
+      });
+
+      return {
+        success: totalSuccess > 0,
+        successCount: totalSuccess,
+        failureCount: totalFailure,
+        failedTokens: allFailedTokens,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Failed to send broadcast notification", error);
+      return {
+        success: false,
+        successCount: 0,
+        failureCount: 0,
+        error: errorMessage,
+      };
+    }
+  }
+
+  async sendToTopic(
+    topic: string,
+    notification: Omit<SendNotificationRequest, "topic">
+  ): Promise<NotificationResult> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const message: admin.messaging.Message = {
+        notification: {
+          title: notification.title,
+          body: notification.body,
+          ...(notification.imageUrl && { imageUrl: notification.imageUrl }),
+        },
+        ...(notification.data && { data: notification.data }),
+        topic,
+      };
+
+      const response = await admin.messaging().send(message);
+
+      logger.info("Topic notification sent", { topic, messageId: response });
+
+      return {
+        success: true,
+        successCount: 1,
+        failureCount: 0,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Failed to send topic notification", { topic, error });
+      return {
+        success: false,
+        successCount: 0,
+        failureCount: 1,
+        error: errorMessage,
+      };
+    }
+  }
+
+  async send(request: SendNotificationRequest): Promise<NotificationResult> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      if (request.tokens && request.tokens.length > 0) {
+        return await this.sendToTokens(request.tokens, request);
+      }
+
+      if (request.userId) {
+        return await this.sendToUser(request.userId, request);
+      }
+
+      if (request.topic) {
+        return await this.sendToTopic(request.topic, request);
+      }
+
+      return await this.sendToAllDevices(request);
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error("Failed to send notification", error);
+      return {
+        success: false,
+        successCount: 0,
+        failureCount: 0,
+        error: errorMessage,
+      };
+    }
+  }
+
+  // ==================== TOPIC SUBSCRIPTION METHODS ====================
+
+  async subscribeToTopic(tokens: string[], topic: string): Promise<void> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const response = await admin.messaging().subscribeToTopic(tokens, topic);
+
+      logger.info("Subscribed devices to topic", {
+        topic,
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+      });
+
+      if (response.failureCount > 0) {
+        logger.warn("Some devices failed to subscribe to topic", {
+          topic,
+          errors: response.errors,
+        });
+      }
+    } catch (error) {
+      logger.error("Failed to subscribe to topic", { topic, error });
+      throw new AppError(
+        "Failed to subscribe to topic",
+        500,
+        "TOPIC_SUBSCRIPTION_FAILED"
+      );
+    }
+  }
+
+  async unsubscribeFromTopic(tokens: string[], topic: string): Promise<void> {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const response = await admin
+        .messaging()
+        .unsubscribeFromTopic(tokens, topic);
+
+      logger.info("Unsubscribed devices from topic", {
+        topic,
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+      });
+    } catch (error) {
+      logger.error("Failed to unsubscribe from topic", { topic, error });
+      throw new AppError(
+        "Failed to unsubscribe from topic",
+        500,
+        "TOPIC_UNSUBSCRIPTION_FAILED"
+      );
+    }
+  }
+
+  // ==================== HELPER METHODS ====================
+
+  private async markTokensInactive(tokens: string[]): Promise<void> {
+    try {
+      await prisma.deviceToken.updateMany({
+        where: { token: { in: tokens } },
+        data: { isActive: false },
+      });
+
+      logger.info("Marked invalid tokens as inactive", {
+        count: tokens.length,
+      });
+    } catch (error) {
+      logger.error("Failed to mark tokens as inactive", error);
+    }
+  }
+
+  async validateAndCleanupToken(token: string) {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const deviceToken = await prisma.deviceToken.findUnique({
+        where: { token },
+      });
+
+      if (!deviceToken) {
+        throw new AppError("Device token not found", 404, "TOKEN_NOT_FOUND");
+      }
+
+      let isValid = true;
+      let errorMessage: string | null = null;
+
+      try {
+        await admin.messaging().send(
+          {
+            token: token,
+            notification: {
+              title: "Test",
+              body: "Token validation",
+            },
+          },
+          true // dry run
+        );
+      } catch (error) {
+        isValid = false;
+        const fcmError = error as { code?: string; message?: string };
+        errorMessage = fcmError.message ?? "Unknown error";
+
+        if (
+          fcmError.code === "messaging/invalid-registration-token" ||
+          fcmError.code === "messaging/registration-token-not-registered"
+        ) {
+          await prisma.deviceToken.update({
+            where: { token },
+            data: { isActive: false },
+          });
+
+          logger.info("Invalid token marked as inactive", {
+            tokenId: deviceToken.id,
+            errorCode: fcmError.code,
+          });
+        }
+      }
+
+      return {
+        token: token,
+        tokenId: deviceToken.id,
+        isValid: isValid,
+        isActive: isValid ? deviceToken.isActive : false,
+        errorMessage: errorMessage,
+        validatedAt: new Date(),
+      };
+    } catch (error) {
+      logger.error("Failed to validate token", error);
+      throw error;
+    }
+  }
+
+  async validateAndCleanupAllTokens() {
+    this.ensureFirebaseInitialized();
+
+    try {
+      const activeTokens = await prisma.deviceToken.findMany({
+        where: { isActive: true },
+        select: {
+          id: true,
+          token: true,
+        },
+      });
+
+      logger.info(
+        `Starting validation for ${activeTokens.length} active tokens`
+      );
+
+      let validCount = 0;
+      let invalidCount = 0;
+      let errorCount = 0;
+      const invalidTokens: string[] = [];
+
+      const batchSize = 100;
+      for (let i = 0; i < activeTokens.length; i += batchSize) {
+        const batch = activeTokens.slice(i, i + batchSize);
+
+        await Promise.all(
+          batch.map(async (deviceToken) => {
+            try {
+              await admin.messaging().send(
+                {
+                  token: deviceToken.token,
+                  notification: {
+                    title: "Test",
+                    body: "Token validation",
+                  },
+                },
+                true // dry run
+              );
+
+              validCount++;
+            } catch (error) {
+              const fcmError = error as { code?: string; message?: string };
+
+              if (
+                fcmError.code === "messaging/invalid-registration-token" ||
+                fcmError.code === "messaging/registration-token-not-registered"
+              ) {
+                await prisma.deviceToken.update({
+                  where: { token: deviceToken.token },
+                  data: { isActive: false },
+                });
+
+                invalidCount++;
+                invalidTokens.push(deviceToken.token);
+
+                logger.info(
+                  "Invalid token marked as inactive during bulk validation",
+                  {
+                    tokenId: deviceToken.id,
+                    errorCode: fcmError.code,
+                  }
+                );
+              } else {
+                errorCount++;
+                logger.error("Error validating token during bulk validation", {
+                  tokenId: deviceToken.id,
+                  error: fcmError.message,
+                });
+              }
+            }
+          })
+        );
+
+        // Rate limiting delay between batches
+        if (i + batchSize < activeTokens.length) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      const result = {
+        totalTokens: activeTokens.length,
+        validTokens: validCount,
+        invalidTokens: invalidCount,
+        errors: errorCount,
+        invalidTokensList: invalidTokens,
+        validatedAt: new Date(),
+      };
+
+      logger.info("Bulk token validation completed", result);
+
+      return result;
+    } catch (error) {
+      logger.error("Failed to validate all tokens", error);
+      throw new AppError(
+        "Failed to validate tokens",
+        500,
+        "BULK_VALIDATION_FAILED"
+      );
+    }
+  }
+
+  async getTokenStats(): Promise<TokenStats> {
+    try {
+      const [total, active, inactive, byPlatform, byType] = await Promise.all([
+        prisma.deviceToken.count(),
+        prisma.deviceToken.count({ where: { isActive: true } }),
+        prisma.deviceToken.count({ where: { isActive: false } }),
+        prisma.deviceToken.groupBy({
+          by: ["platform"],
+          _count: { _all: true },
+        }),
+        prisma.deviceToken.groupBy({
+          by: ["type"],
+          _count: { _all: true },
+        }),
+      ]);
+
+      return {
+        total,
+        active,
+        inactive,
+        byPlatform: byPlatform.reduce(
+          (acc, curr) => {
+            acc[curr.platform] = curr._count._all;
+            return acc;
+          },
+          {} as Record<Platform, number>
+        ),
+        byType: byType.reduce(
+          (acc, curr) => {
+            acc[curr.type] = curr._count._all;
+            return acc;
+          },
+          {} as Record<NotificationType, number>
+        ),
+      };
+    } catch (error) {
+      logger.error("Failed to get token statistics", error);
+      throw new AppError("Failed to get token statistics", 500, "STATS_FAILED");
+    }
+  }
+
+  async cleanupInactiveTokens(olderThanDays: number = 30): Promise<number> {
+    try {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
+
+      const result = await prisma.deviceToken.deleteMany({
+        where: {
+          isActive: false,
+          updatedAt: { lt: cutoffDate },
+        },
+      });
+
+      logger.info("Cleaned up inactive tokens", {
+        count: result.count,
+        olderThanDays,
+      });
+
+      return result.count;
+    } catch (error) {
+      logger.error("Failed to cleanup inactive tokens", error);
+      throw new AppError(
+        "Failed to cleanup inactive tokens",
+        500,
+        "CLEANUP_FAILED"
+      );
+    }
+  }
+
+  getStatus() {
+    return {
+      isInitialized: this.isFirebaseInitialized,
+      appsCount: admin.apps.length,
+    };
+  }
+}
+
+// Export singleton instance
+export const fcmService = new FCMService();

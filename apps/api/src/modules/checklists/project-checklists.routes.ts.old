@@ -1,0 +1,136 @@
+import { Router } from 'express';
+import { ProjectChecklistsController } from './project-checklists.controller';
+import { authenticateToken, requirePermissions } from '../../middleware/auth.middleware';
+import { upload } from '../../middleware/upload.middleware';
+
+const router: Router = Router({ mergeParams: true }); // Allow access to parent route params
+const projectChecklistsController = new ProjectChecklistsController();
+
+// Apply authentication to all routes
+router.use(authenticateToken);
+
+// Get all checklists for a project
+router.get('/', 
+  requirePermissions(['checklists:read']), 
+  projectChecklistsController.getProjectChecklists
+);
+
+// Create checklists for project (from services)
+router.post('/', 
+  requirePermissions(['checklists:create']), 
+  projectChecklistsController.createProjectChecklists
+);
+
+// Get available templates for manual assignment
+router.get('/available-templates1', 
+  requirePermissions(['checklists:read']), 
+  projectChecklistsController.getTemplateFiles
+);
+// Get available templates for manual assignment
+router.get('/available-templates', 
+  requirePermissions(['checklists:read']), 
+  projectChecklistsController.getTemplateFiles
+);
+
+// Manually assign additional template to project
+router.post('/assign-template', 
+  requirePermissions(['checklists:create']), 
+  projectChecklistsController.assignTemplateToProject
+);
+
+// Get specific checklist with items
+router.get('/:checklistId', 
+  requirePermissions(['checklists:read']), 
+  projectChecklistsController.getProjectChecklist
+);
+
+// Update checklist status
+router.put('/:checklistId/status', 
+  requirePermissions(['checklists:update']), 
+  projectChecklistsController.updateChecklistStatus
+);
+
+// Verify checklist (QA process)
+router.post('/:checklistId/verify', 
+  requirePermissions(['checklists:verify']), 
+  projectChecklistsController.verifyChecklist
+);
+
+// Get checklist completeness
+router.get('/:checklistId/completeness', 
+  requirePermissions(['checklists:read']), 
+  projectChecklistsController.getChecklistCompleteness
+);
+
+// Clone checklist version
+router.post('/:checklistId/clone', 
+  requirePermissions(['checklists:create']), 
+  projectChecklistsController.cloneChecklistVersion
+);
+
+// Update checklist item value
+router.put('/:checklistId/items/:itemId', 
+  requirePermissions(['checklists:update']), 
+  projectChecklistsController.updateChecklistItem
+);
+
+// Upload file for checklist item
+router.post('/:checklistId/items/:itemId/files', 
+  requirePermissions(['checklists:update']),
+  upload.single('file'),
+  projectChecklistsController.uploadItemFile
+);
+
+// Download file for checklist item (must be before dynamic routes)
+router.get('/:checklistId/items/:itemId/files/:fileId/download',
+  requirePermissions(['checklists:read']),
+  projectChecklistsController.downloadItemFile
+);
+
+// ============================================
+// File Status Workflow Routes
+// ============================================
+
+// Submit file for review (Client action)
+router.post('/files/:fileId/submit',
+  requirePermissions(['checklists:submit']),
+  projectChecklistsController.submitFileForReview
+);
+
+// Mark file as under review (Admin action)
+router.post('/files/:fileId/mark-under-review',
+  requirePermissions(['checklists:review']),
+  projectChecklistsController.markFileUnderReview
+);
+
+// Send file back with remarks (Admin action)
+router.post('/files/:fileId/send-back',
+  requirePermissions(['checklists:review']),
+  projectChecklistsController.sendFileBackWithRemarks
+);
+
+// Verify file (Admin action)
+router.post('/files/:fileId/verify',
+  requirePermissions(['checklists:verify']),
+  projectChecklistsController.verifyFile
+);
+
+// Get file version history
+router.get('/files/:fileId/versions',
+  requirePermissions(['checklists:read']),
+  projectChecklistsController.getFileVersionHistory
+);
+
+// Close checklist and lock all files (Admin action)
+router.post('/:checklistId/close',
+  requirePermissions(['checklists:verify']),
+  projectChecklistsController.closeChecklistAndLockFiles
+);
+
+// Submit all files in checklist for review (Client action)
+router.post('/:checklistId/submit',
+  requirePermissions(['checklists:submit']),
+  projectChecklistsController.submitChecklistForReview
+);
+
+export default router;
